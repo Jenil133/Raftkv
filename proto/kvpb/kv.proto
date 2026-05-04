@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package raftkv.kv;
+
+option go_package = "github.com/Jenil133/raftkv/proto/kvpb";
+
+enum Status {
+  OK = 0;
+  NOT_LEADER = 1;
+  TIMEOUT = 2;
+  ERROR = 3;
+}
+
+enum Op {
+  PUT = 0;
+  DELETE = 1;
+  CAS = 2;
+}
+
+// Command is the payload of a replicated log entry.
+message Command {
+  Op op = 1;
+  string key = 2;
+  bytes value = 3;
+  bytes expected = 4;
+  bool expect_absent = 5;
+  uint64 client_id = 6;
+  uint64 seq = 7;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  uint64 client_id = 3;
+  uint64 seq = 4;
+}
+
+message PutResponse {
+  Status status = 1;
+  uint64 leader_hint = 2;
+  string error = 3;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  Status status = 1;
+  uint64 leader_hint = 2;
+  string error = 3;
+  bool found = 4;
+  bytes value = 5;
+}
+
+message DeleteRequest {
+  string key = 1;
+  uint64 client_id = 2;
+  uint64 seq = 3;
+}
+
+message DeleteResponse {
+  Status status = 1;
+  uint64 leader_hint = 2;
+  string error = 3;
+  bool existed = 4;
+}
+
+message CASRequest {
+  string key = 1;
+  bytes expected = 2;
+  bool expect_absent = 3;
+  bytes value = 4;
+  uint64 client_id = 5;
+  uint64 seq = 6;
+}
+
+message CASResponse {
+  Status status = 1;
+  uint64 leader_hint = 2;
+  string error = 3;
+  bool swapped = 4;
+  bool found = 5;
+  bytes current = 6;
+}
+
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CAS(CASRequest) returns (CASResponse);
+}
