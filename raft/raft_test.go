@@ -3,10 +3,14 @@ package raft_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/Jenil133/raftkv/internal/cluster"
+	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
 )
 
@@ -187,6 +191,144 @@ func TestPersistenceAcrossFullRestart(t *testing.T) {
 	}
 }
 
+func TestMinorityPartitionCannotCommit(t *testing.T) {
+	c := cluster.New(t, 5)
+	old := c.WaitLeader(3 * time.Second)
+	cl := c.Client()
+	ctx := ctxTimeout(t, 30*time.Second)
+	if err := cl.Put(ctx, "before", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Strand the leader with one follower (2 of 5).
+	var buddy raft.NodeID
+	var majority []raft.NodeID
+	for _, id := range c.IDs {
+		switch {
+		case id == old:
+		case buddy == 0:
+			buddy = id
+		default:
+			majority = append(majority, id)
+		}
+	}
+	c.Net.Partition([]raft.NodeID{old, buddy}, majority)
+
+	// The stranded leader accepts a proposal but can never commit it.
+	oldNode := c.Member(old).Raft
+	junk, err := proto.Marshal(&kvpb.Command{Op: kvpb.Op_PUT, Key: "junk", Value: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, _, proposed := oldNode.Propose(junk)
+
+	// Majority elects its own leader and makes progress.
+	c.WaitLeader(5*time.Second, majority...)
+	mc := c.Client()
+	if err := mc.Put(ctx, "during", []byte("2")); err != nil {
+		t.Fatalf("majority could not commit: %v", err)
+	}
+	if st := oldNode.Status(); proposed && st.CommitIndex >= idx {
+		t.Fatalf("stranded leader committed index %d in a minority (commit=%d)", idx, st.CommitIndex)
+	}
+
+	// Heal: old leader steps down, its uncommitted junk is discarded.
+	c.Net.Heal()
+	c.Eventually(5*time.Second, "single leader after heal", func() bool {
+		return len(c.Leaders()) == 1
+	})
+	c.Eventually(5*time.Second, "all nodes converge", func() bool {
+		for _, id := range c.IDs {
+			d := c.Member(id).KV.Store().Dump()
+			if d["before"] != "1" || d["during"] != "2" {
+				return false
+			}
+			if _, ok := d["junk"]; ok {
+				t.Errorf("node %d applied uncommitted entry", id)
+			}
+		}
+		return true
+	})
+}
+
+func TestLinearizableReadSeesLatestWrite(t *testing.T) {
+	c := cluster.New(t, 5)
+	c.WaitLeader(3 * time.Second)
+	writer, reader := c.Client(), c.Client()
+	ctx := ctxTimeout(t, 20*time.Second)
+	for i := 0; i < 30; i++ {
+		val := []byte(fmt.Sprintf("%d", i))
+		if err := writer.Put(ctx, "x", val); err != nil {
+			t.Fatal(err)
+		}
+		got, ok, err := reader.Get(ctx, "x")
+		if err != nil || !ok || string(got) != string(val) {
+			t.Fatalf("iter %d: read %q ok=%v err=%v, want %q", i, got, ok, err, val)
+		}
+	}
+}
+
+func TestStaleLeaderCannotServeReads(t *testing.T) {
+	c := cluster.New(t, 5)
+	old := c.WaitLeader(3 * time.Second)
+	c.Net.Isolate(old)
+	// Isolated old leader must fail ReadIndex rather than return stale data.
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if _, err := c.Member(old).Raft.ReadIndex(ctx); err == nil {
+		t.Fatal("isolated leader served a read index")
+	}
+}
+
+func TestConcurrentClientsWithLeaderChurn(t *testing.T) {
+	c := cluster.New(t, 5)
+	c.WaitLeader(3 * time.Second)
+	ctx := ctxTimeout(t, 60*time.Second)
+
+	const clients, perClient = 6, 25
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+	for ci := 0; ci < clients; ci++ {
+		wg.Add(1)
+		go func(ci int) {
+			defer wg.Done()
+			cl := c.Client()
+			for i := 0; i < perClient; i++ {
+				key := fmt.Sprintf("c%d-%d", ci, i)
+				if err := cl.Put(ctx, key, []byte(key)); err != nil {
+					errs <- fmt.Errorf("client %d put %d: %w", ci, i, err)
+					return
+				}
+			}
+		}(ci)
+	}
+
+	// Meanwhile kill and revive the leader a couple of times.
+	for round := 0; round < 2; round++ {
+		time.Sleep(150 * time.Millisecond)
+		if ls := c.Leaders(); len(ls) > 0 {
+			c.Crash(ls[0])
+			time.Sleep(300 * time.Millisecond)
+			c.Restart(ls[0])
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	total := clients * perClient
+	c.Eventually(10*time.Second, "every replica has every key", func() bool {
+		for _, id := range c.IDs {
+			if len(c.Member(id).KV.Store().Dump()) != total {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 func TestSingleNodeCluster(t *testing.T) {
 	c := cluster.New(t, 1)
 	c.WaitLeader(2 * time.Second)
@@ -199,4 +341,27 @@ func TestSingleNodeCluster(t *testing.T) {
 	if err != nil || !ok || string(v) != "b" {
 		t.Fatalf("got %q %v %v", v, ok, err)
 	}
+}
+
+func TestFlakyNetworkStillConverges(t *testing.T) {
+	c := cluster.New(t, 5)
+	c.WaitLeader(3 * time.Second)
+	c.Net.SetDropRate(0.2)
+	c.Net.SetDelay(0, 10*time.Millisecond)
+	cl := c.Client()
+	ctx := ctxTimeout(t, 60*time.Second)
+	for i := 0; i < 30; i++ {
+		if err := cl.Put(ctx, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	c.Net.SetDropRate(0)
+	c.Eventually(10*time.Second, "converge", func() bool {
+		for _, id := range c.IDs {
+			if len(c.Member(id).KV.Store().Dump()) != 30 {
+				return false
+			}
+		}
+		return true
+	})
 }
