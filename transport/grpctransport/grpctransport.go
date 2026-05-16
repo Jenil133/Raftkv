@@ -4,6 +4,8 @@ package grpctransport
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -155,4 +157,28 @@ func (s *server) AppendEntries(_ context.Context, r *raftpb.AppendEntriesRequest
 		ConflictIndex: reply.ConflictIndex,
 		ConflictTerm:  reply.ConflictTerm,
 	}, nil
+}
+
+// ParseAddrs parses "1=host:port,2=host:port" into a node address map.
+func ParseAddrs(s string) (map[raft.NodeID]string, error) {
+	out := make(map[raft.NodeID]string)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok || v == "" {
+			return nil, fmt.Errorf("bad address %q, want id=host:port", part)
+		}
+		id, err := strconv.ParseUint(strings.TrimSpace(k), 10, 64)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("bad node id in %q", part)
+		}
+		out[raft.NodeID(id)] = strings.TrimSpace(v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no addresses given")
+	}
+	return out, nil
 }
