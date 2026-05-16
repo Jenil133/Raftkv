@@ -309,6 +309,7 @@ func (n *Node) becomeFollowerLocked(term uint64, leader NodeID) {
 		n.term = term
 		n.votedFor = 0
 		n.saveHardStateLocked()
+		n.syncLocked()
 	}
 	n.role = Follower
 	n.leader = leader
