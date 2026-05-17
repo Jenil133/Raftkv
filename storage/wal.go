@@ -32,7 +32,7 @@ type WAL struct {
 	f     *os.File
 	w     *bufio.Writer
 	dirty bool
-	// loaded state, handed out once by Load.
+	// replayed state, handed out once by Load.
 	hs      raft.HardState
 	entries []raft.Entry
 	// NoSync skips fsync; useful for benchmarks and tests.
@@ -155,12 +155,14 @@ func (w *WAL) writeRecord(typ byte, payload []byte) error {
 	return nil
 }
 
+// Load hands out the state replayed at open time. It is meant to be called
+// once, at node startup; the replayed copy is released afterwards.
 func (w *WAL) Load() (raft.HardState, []raft.Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	out := make([]raft.Entry, len(w.entries))
-	copy(out, w.entries)
-	return w.hs, out, nil
+	entries := w.entries
+	w.entries = nil
+	return w.hs, entries, nil
 }
 
 func (w *WAL) SaveHardState(hs raft.HardState) error {
