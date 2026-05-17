@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/Jenil133/raftkv/proto/kvpb"
 )
 
@@ -104,6 +106,45 @@ func (s *Store) Dump() map[string]string {
 		out[k] = string(v)
 	}
 	return out
+}
+
+// Snapshot serialises the whole state machine, including the client session
+// table so exactly-once guarantees survive compaction.
+func (s *Store) Snapshot() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap := &kvpb.StoreSnapshot{
+		Data:     make(map[string][]byte, len(s.data)),
+		Sessions: make(map[uint64]*kvpb.SessionState, len(s.sessions)),
+	}
+	for k, v := range s.data {
+		snap.Data[k] = v
+	}
+	for id, sess := range s.sessions {
+		snap.Sessions[id] = &kvpb.SessionState{
+			Seq: sess.seq, Found: sess.result.Found, Value: sess.result.Value, Swapped: sess.result.Swapped,
+		}
+	}
+	return proto.Marshal(snap)
+}
+
+// Restore replaces the state machine with the contents of a snapshot.
+func (s *Store) Restore(data []byte) error {
+	var snap kvpb.StoreSnapshot
+	if err := proto.Unmarshal(data, &snap); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = make(map[string][]byte, len(snap.Data))
+	for k, v := range snap.Data {
+		s.data[k] = append([]byte(nil), v...)
+	}
+	s.sessions = make(map[uint64]session, len(snap.Sessions))
+	for id, st := range snap.Sessions {
+		s.sessions[id] = session{seq: st.Seq, result: Result{Found: st.Found, Value: st.Value, Swapped: st.Swapped}}
+	}
+	return nil
 }
 
 // Keys returns all keys in sorted order.

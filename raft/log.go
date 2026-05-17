@@ -12,6 +12,26 @@ func newRaftLog() *raftLog {
 	return &raftLog{entries: []Entry{{}}}
 }
 
+// compactTo drops entries up to and including index, which must be inside the
+// log. Later entries are kept.
+func (l *raftLog) compactTo(index uint64) {
+	t, ok := l.term(index)
+	if !ok || index <= l.offset {
+		panic("raft: compacting outside log")
+	}
+	rest := l.entries[index-l.offset+1:]
+	entries := make([]Entry, 1, len(rest)+1)
+	entries[0] = Entry{Term: t, Index: index}
+	l.entries = append(entries, rest...)
+	l.offset = index
+}
+
+// reset discards the whole log and restarts it after (index, term).
+func (l *raftLog) reset(index, term uint64) {
+	l.entries = []Entry{{Term: term, Index: index}}
+	l.offset = index
+}
+
 func (l *raftLog) firstIndex() uint64 { return l.offset + 1 }
 
 func (l *raftLog) lastIndex() uint64 { return l.offset + uint64(len(l.entries)) - 1 }

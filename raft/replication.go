@@ -56,6 +56,11 @@ func (n *Node) replicateOnce(peer NodeID, term uint64) (stillLeader, more bool) 
 	}
 	next := n.nextIndex[peer]
 	prev := next - 1
+	if prev < n.log.offset {
+		// The entries this follower needs were compacted away.
+		n.mu.Unlock()
+		return n.replicateSnapshot(peer, term)
+	}
 	prevTerm, _ := n.log.term(prev)
 	args := &AppendEntriesArgs{
 		Term:         term,
@@ -161,26 +166,40 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 	n.resetElectionDeadline()
 	reply := &AppendEntriesReply{Term: n.term}
 
+	// Entries already covered by our snapshot are committed and identical to
+	// the leader's, so skip over them.
+	prevIndex, prevTerm, entries := args.PrevLogIndex, args.PrevLogTerm, args.Entries
+	if prevIndex < n.log.offset {
+		skip := n.log.offset - prevIndex
+		if uint64(len(entries)) <= skip {
+			entries = nil
+		} else {
+			entries = entries[skip:]
+		}
+		prevIndex = n.log.offset
+		prevTerm, _ = n.log.term(prevIndex)
+	}
+
 	last := n.log.lastIndex()
-	if args.PrevLogIndex > last {
+	if prevIndex > last {
 		reply.ConflictIndex = last + 1
 		return reply, nil
 	}
-	if t, ok := n.log.term(args.PrevLogIndex); !ok || t != args.PrevLogTerm {
+	if t, ok := n.log.term(prevIndex); !ok || t != prevTerm {
 		reply.ConflictTerm = t
-		reply.ConflictIndex = n.log.firstIndexOfTerm(t, args.PrevLogIndex)
+		reply.ConflictIndex = n.log.firstIndexOfTerm(t, prevIndex)
 		return reply, nil
 	}
 
 	dirty := false
-	for i, e := range args.Entries {
+	for i, e := range entries {
 		if e.Index <= n.log.lastIndex() {
 			if t, _ := n.log.term(e.Index); t == e.Term {
 				continue // already have it
 			}
 			n.truncateLocked(e.Index)
 		}
-		n.appendLocked(args.Entries[i:]...)
+		n.appendLocked(entries[i:]...)
 		dirty = true
 		break
 	}

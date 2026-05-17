@@ -759,6 +759,127 @@ func (x *CASResponse) GetCurrent() []byte {
 	return nil
 }
 
+// StoreSnapshot is the serialized state machine used for Raft snapshots.
+type StoreSnapshot struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	Data          map[string][]byte        `protobuf:"bytes,1,rep,name=data,proto3" json:"data,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Sessions      map[uint64]*SessionState `protobuf:"bytes,2,rep,name=sessions,proto3" json:"sessions,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StoreSnapshot) Reset() {
+	*x = StoreSnapshot{}
+	mi := &file_proto_kvpb_kv_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StoreSnapshot) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StoreSnapshot) ProtoMessage() {}
+
+func (x *StoreSnapshot) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kvpb_kv_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StoreSnapshot.ProtoReflect.Descriptor instead.
+func (*StoreSnapshot) Descriptor() ([]byte, []int) {
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *StoreSnapshot) GetData() map[string][]byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *StoreSnapshot) GetSessions() map[uint64]*SessionState {
+	if x != nil {
+		return x.Sessions
+	}
+	return nil
+}
+
+type SessionState struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Seq           uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	Found         bool                   `protobuf:"varint,2,opt,name=found,proto3" json:"found,omitempty"`
+	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	Swapped       bool                   `protobuf:"varint,4,opt,name=swapped,proto3" json:"swapped,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SessionState) Reset() {
+	*x = SessionState{}
+	mi := &file_proto_kvpb_kv_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SessionState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SessionState) ProtoMessage() {}
+
+func (x *SessionState) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kvpb_kv_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SessionState.ProtoReflect.Descriptor instead.
+func (*SessionState) Descriptor() ([]byte, []int) {
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *SessionState) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *SessionState) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *SessionState) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *SessionState) GetSwapped() bool {
+	if x != nil {
+		return x.Swapped
+	}
+	return false
+}
+
 var File_proto_kvpb_kv_proto protoreflect.FileDescriptor
 
 const file_proto_kvpb_kv_proto_rawDesc = "" +
@@ -818,7 +939,21 @@ const file_proto_kvpb_kv_proto_rawDesc = "" +
 	"\x05error\x18\x03 \x01(\tR\x05error\x12\x18\n" +
 	"\aswapped\x18\x04 \x01(\bR\aswapped\x12\x14\n" +
 	"\x05found\x18\x05 \x01(\bR\x05found\x12\x18\n" +
-	"\acurrent\x18\x06 \x01(\fR\acurrent*8\n" +
+	"\acurrent\x18\x06 \x01(\fR\acurrent\"\x9a\x02\n" +
+	"\rStoreSnapshot\x126\n" +
+	"\x04data\x18\x01 \x03(\v2\".raftkv.kv.StoreSnapshot.DataEntryR\x04data\x12B\n" +
+	"\bsessions\x18\x02 \x03(\v2&.raftkv.kv.StoreSnapshot.SessionsEntryR\bsessions\x1a7\n" +
+	"\tDataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\x1aT\n" +
+	"\rSessionsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\x04R\x03key\x12-\n" +
+	"\x05value\x18\x02 \x01(\v2\x17.raftkv.kv.SessionStateR\x05value:\x028\x01\"f\n" +
+	"\fSessionState\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x14\n" +
+	"\x05found\x18\x02 \x01(\bR\x05found\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\x12\x18\n" +
+	"\aswapped\x18\x04 \x01(\bR\aswapped*8\n" +
 	"\x06Status\x12\x06\n" +
 	"\x02OK\x10\x00\x12\x0e\n" +
 	"\n" +
@@ -849,7 +984,7 @@ func file_proto_kvpb_kv_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_kvpb_kv_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_kvpb_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_proto_kvpb_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_proto_kvpb_kv_proto_goTypes = []any{
 	(Status)(0),            // 0: raftkv.kv.Status
 	(Op)(0),                // 1: raftkv.kv.Op
@@ -862,6 +997,10 @@ var file_proto_kvpb_kv_proto_goTypes = []any{
 	(*DeleteResponse)(nil), // 8: raftkv.kv.DeleteResponse
 	(*CASRequest)(nil),     // 9: raftkv.kv.CASRequest
 	(*CASResponse)(nil),    // 10: raftkv.kv.CASResponse
+	(*StoreSnapshot)(nil),  // 11: raftkv.kv.StoreSnapshot
+	(*SessionState)(nil),   // 12: raftkv.kv.SessionState
+	nil,                    // 13: raftkv.kv.StoreSnapshot.DataEntry
+	nil,                    // 14: raftkv.kv.StoreSnapshot.SessionsEntry
 }
 var file_proto_kvpb_kv_proto_depIdxs = []int32{
 	1,  // 0: raftkv.kv.Command.op:type_name -> raftkv.kv.Op
@@ -869,19 +1008,22 @@ var file_proto_kvpb_kv_proto_depIdxs = []int32{
 	0,  // 2: raftkv.kv.GetResponse.status:type_name -> raftkv.kv.Status
 	0,  // 3: raftkv.kv.DeleteResponse.status:type_name -> raftkv.kv.Status
 	0,  // 4: raftkv.kv.CASResponse.status:type_name -> raftkv.kv.Status
-	3,  // 5: raftkv.kv.KV.Put:input_type -> raftkv.kv.PutRequest
-	5,  // 6: raftkv.kv.KV.Get:input_type -> raftkv.kv.GetRequest
-	7,  // 7: raftkv.kv.KV.Delete:input_type -> raftkv.kv.DeleteRequest
-	9,  // 8: raftkv.kv.KV.CAS:input_type -> raftkv.kv.CASRequest
-	4,  // 9: raftkv.kv.KV.Put:output_type -> raftkv.kv.PutResponse
-	6,  // 10: raftkv.kv.KV.Get:output_type -> raftkv.kv.GetResponse
-	8,  // 11: raftkv.kv.KV.Delete:output_type -> raftkv.kv.DeleteResponse
-	10, // 12: raftkv.kv.KV.CAS:output_type -> raftkv.kv.CASResponse
-	9,  // [9:13] is the sub-list for method output_type
-	5,  // [5:9] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	13, // 5: raftkv.kv.StoreSnapshot.data:type_name -> raftkv.kv.StoreSnapshot.DataEntry
+	14, // 6: raftkv.kv.StoreSnapshot.sessions:type_name -> raftkv.kv.StoreSnapshot.SessionsEntry
+	12, // 7: raftkv.kv.StoreSnapshot.SessionsEntry.value:type_name -> raftkv.kv.SessionState
+	3,  // 8: raftkv.kv.KV.Put:input_type -> raftkv.kv.PutRequest
+	5,  // 9: raftkv.kv.KV.Get:input_type -> raftkv.kv.GetRequest
+	7,  // 10: raftkv.kv.KV.Delete:input_type -> raftkv.kv.DeleteRequest
+	9,  // 11: raftkv.kv.KV.CAS:input_type -> raftkv.kv.CASRequest
+	4,  // 12: raftkv.kv.KV.Put:output_type -> raftkv.kv.PutResponse
+	6,  // 13: raftkv.kv.KV.Get:output_type -> raftkv.kv.GetResponse
+	8,  // 14: raftkv.kv.KV.Delete:output_type -> raftkv.kv.DeleteResponse
+	10, // 15: raftkv.kv.KV.CAS:output_type -> raftkv.kv.CASResponse
+	12, // [12:16] is the sub-list for method output_type
+	8,  // [8:12] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_proto_kvpb_kv_proto_init() }
@@ -895,7 +1037,7 @@ func file_proto_kvpb_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_kvpb_kv_proto_rawDesc), len(file_proto_kvpb_kv_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   9,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

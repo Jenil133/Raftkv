@@ -74,6 +74,7 @@ func (n *Node) startElectionLocked() {
 	n.syncLocked()
 	n.resetElectionDeadline()
 	term := n.term
+	n.stats.Elections++
 	n.logger.Debug("starting election", "term", term)
 
 	votes := 1
@@ -126,7 +127,9 @@ func (n *Node) becomeLeaderLocked() {
 	n.matchIndex = make(map[NodeID]uint64, len(n.peers))
 	n.wake = make(map[NodeID]chan struct{}, len(n.peers))
 	n.peerAck = make(map[NodeID]uint64, len(n.peers))
+	n.snapOff = make(map[NodeID]uint64, len(n.peers))
 	n.reads = nil
+	n.stats.TermsAsLeader++
 	last := n.log.lastIndex()
 	for _, p := range n.peers {
 		n.nextIndex[p] = last + 1

@@ -84,6 +84,19 @@ message CASResponse {
   bytes current = 6;
 }
 
+// StoreSnapshot is the serialized state machine used for Raft snapshots.
+message StoreSnapshot {
+  map<string, bytes> data = 1;
+  map<uint64, SessionState> sessions = 2;
+}
+
+message SessionState {
+  uint64 seq = 1;
+  bool found = 2;
+  bytes value = 3;
+  bool swapped = 4;
+}
+
 service KV {
   rpc Put(PutRequest) returns (PutResponse);
   rpc Get(GetRequest) returns (GetResponse);

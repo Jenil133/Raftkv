@@ -54,15 +54,49 @@ type HardState struct {
 	VotedFor NodeID
 }
 
+// Snapshot is a point-in-time image of the state machine covering every log
+// entry up to and including Index.
+type Snapshot struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
+
+// State is everything a node reads back from Storage on startup.
+type State struct {
+	HardState HardState
+	Snapshot  Snapshot // zero Index if none
+	// Entries are the log entries after Snapshot.Index, in order.
+	Entries []Entry
+}
+
+// Apply is delivered to the state machine in order: either one committed log
+// entry, or a snapshot that replaces the entire state machine.
+type Apply struct {
+	Entry    Entry
+	Snapshot *Snapshot
+}
+
 // Status is a point-in-time view of a node, for tests and metrics.
 type Status struct {
-	ID          NodeID
-	Term        uint64
-	Role        Role
-	Leader      NodeID
-	CommitIndex uint64
-	LastApplied uint64
-	LastIndex   uint64
+	ID            NodeID
+	Term          uint64
+	Role          Role
+	Leader        NodeID
+	CommitIndex   uint64
+	LastApplied   uint64
+	LastIndex     uint64
+	SnapshotIndex uint64 // log entries up to here have been compacted away
+	LogLength     uint64 // entries currently held in the log
+}
+
+// Stats are monotonically increasing counters.
+type Stats struct {
+	SnapshotsTaken     uint64
+	SnapshotsSent      uint64
+	SnapshotsInstalled uint64
+	Elections          uint64
+	TermsAsLeader      uint64
 }
 
 type RequestVoteArgs struct {
@@ -93,6 +127,25 @@ type AppendEntriesReply struct {
 	// On failure, hints that let the leader skip back over a whole term.
 	ConflictIndex uint64
 	ConflictTerm  uint64
+}
+
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          NodeID
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	// Offset is the position of Data within the full snapshot; large
+	// snapshots are sent in chunks.
+	Offset uint64
+	Data   []byte
+	Done   bool
+}
+
+type InstallSnapshotReply struct {
+	Term uint64
+	// NextOffset is how many snapshot bytes the follower now holds, i.e. where
+	// the leader should continue from.
+	NextOffset uint64
 }
 
 var (

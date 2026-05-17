@@ -110,6 +110,26 @@ func (t *Transport) AppendEntries(ctx context.Context, to raft.NodeID, a *raft.A
 	}, nil
 }
 
+func (t *Transport) InstallSnapshot(ctx context.Context, to raft.NodeID, a *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	c, err := t.client(to)
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.InstallSnapshot(ctx, &raftpb.InstallSnapshotRequest{
+		Term:              a.Term,
+		LeaderId:          uint64(a.LeaderID),
+		LastIncludedIndex: a.LastIncludedIndex,
+		LastIncludedTerm:  a.LastIncludedTerm,
+		Offset:            a.Offset,
+		Data:              a.Data,
+		Done:              a.Done,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raft.InstallSnapshotReply{Term: r.Term, NextOffset: r.NextOffset}, nil
+}
+
 // server adapts a raft.Handler to the generated gRPC service.
 type server struct {
 	raftpb.UnimplementedRaftServer
@@ -157,6 +177,22 @@ func (s *server) AppendEntries(_ context.Context, r *raftpb.AppendEntriesRequest
 		ConflictIndex: reply.ConflictIndex,
 		ConflictTerm:  reply.ConflictTerm,
 	}, nil
+}
+
+func (s *server) InstallSnapshot(_ context.Context, r *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	reply, err := s.h.HandleInstallSnapshot(&raft.InstallSnapshotArgs{
+		Term:              r.Term,
+		LeaderID:          raft.NodeID(r.LeaderId),
+		LastIncludedIndex: r.LastIncludedIndex,
+		LastIncludedTerm:  r.LastIncludedTerm,
+		Offset:            r.Offset,
+		Data:              r.Data,
+		Done:              r.Done,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &raftpb.InstallSnapshotResponse{Term: reply.Term, NextOffset: reply.NextOffset}, nil
 }
 
 // ParseAddrs parses "1=host:port,2=host:port" into a node address map.

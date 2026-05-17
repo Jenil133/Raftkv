@@ -21,6 +21,8 @@ type Config struct {
 	HeartbeatInterval  time.Duration
 	// MaxEntriesPerMsg bounds the batch size of a single AppendEntries.
 	MaxEntriesPerMsg int
+	// SnapshotChunkSize bounds the bytes sent per InstallSnapshot RPC.
+	SnapshotChunkSize int
 	// ApplyBuffer is the capacity of the channel returned by Applied.
 	ApplyBuffer int
 
@@ -39,6 +41,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxEntriesPerMsg == 0 {
 		c.MaxEntriesPerMsg = 256
+	}
+	if c.SnapshotChunkSize == 0 {
+		c.SnapshotChunkSize = 256 << 10
 	}
 	if c.ApplyBuffer == 0 {
 		c.ApplyBuffer = 1024
@@ -74,12 +79,19 @@ type Node struct {
 	hbSeq      uint64
 	peerAck    map[NodeID]uint64
 	reads      []*readReq
+	snapOff    map[NodeID]uint64 // bytes of the snapshot already sent per peer
 
 	electionDeadline  time.Time
 	lastLeaderContact time.Time
 
+	// Snapshot state. The log offset always equals snapshot.Index.
+	snapshot    Snapshot
+	pendingSnap *Snapshot // snapshot waiting to be handed to the state machine
+	incoming    *incomingSnapshot
+	stats       Stats
+
 	applyCond *sync.Cond
-	applyCh   chan Entry
+	applyCh   chan Apply
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -106,12 +118,16 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("raft: node %d not in peer list", cfg.ID)
 	}
 
-	hs, entries, err := cfg.Storage.Load()
+	st, err := cfg.Storage.Load()
 	if err != nil {
 		return nil, fmt.Errorf("raft: load storage: %w", err)
 	}
+	hs := st.HardState
 	l := newRaftLog()
-	for _, e := range entries {
+	if st.Snapshot.Index > 0 {
+		l.reset(st.Snapshot.Index, st.Snapshot.Term)
+	}
+	for _, e := range st.Entries {
 		if e.Index != l.lastIndex()+1 {
 			return nil, fmt.Errorf("raft: storage has non-contiguous log at index %d", e.Index)
 		}
@@ -129,9 +145,17 @@ func NewNode(cfg Config) (*Node, error) {
 		term:     hs.Term,
 		votedFor: hs.VotedFor,
 		log:      l,
-		applyCh:  make(chan Entry, cfg.ApplyBuffer),
+		applyCh:  make(chan Apply, cfg.ApplyBuffer),
 		ctx:      ctx,
 		cancel:   cancel,
+	}
+	if st.Snapshot.Index > 0 {
+		// The state machine starts empty and is restored from the snapshot
+		// before any entry is delivered.
+		snap := st.Snapshot
+		n.snapshot = snap
+		n.pendingSnap = &snap
+		n.commitIndex = snap.Index
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 	return n, nil
@@ -161,9 +185,16 @@ func (n *Node) Stop() {
 	n.wg.Wait()
 }
 
-// Applied delivers committed entries in log order. The channel is closed when
-// the node stops.
-func (n *Node) Applied() <-chan Entry { return n.applyCh }
+// Applied delivers committed entries and installed snapshots in order. The
+// channel is closed when the node stops.
+func (n *Node) Applied() <-chan Apply { return n.applyCh }
+
+// Stats returns the node's counters.
+func (n *Node) Stats() Stats {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.stats
+}
 
 // Status returns a snapshot of the node's state.
 func (n *Node) Status() Status {
@@ -177,6 +208,9 @@ func (n *Node) Status() Status {
 		CommitIndex: n.commitIndex,
 		LastApplied: n.lastApplied,
 		LastIndex:   n.log.lastIndex(),
+
+		SnapshotIndex: n.log.offset,
+		LogLength:     n.log.lastIndex() - n.log.offset,
 	}
 }
 
@@ -272,12 +306,25 @@ func (n *Node) applyLoop() {
 	defer close(n.applyCh)
 	for {
 		n.mu.Lock()
-		for !n.stopped && n.lastApplied >= n.commitIndex {
+		for !n.stopped && n.pendingSnap == nil && n.lastApplied >= n.commitIndex {
 			n.applyCond.Wait()
 		}
 		if n.stopped {
 			n.mu.Unlock()
 			return
+		}
+		if snap := n.pendingSnap; snap != nil {
+			n.pendingSnap = nil
+			n.mu.Unlock()
+			select {
+			case n.applyCh <- Apply{Snapshot: snap}:
+			case <-n.ctx.Done():
+				return
+			}
+			n.mu.Lock()
+			n.lastApplied = snap.Index
+			n.mu.Unlock()
+			continue
 		}
 		lo, hi := n.lastApplied+1, n.commitIndex
 		batch := make([]Entry, 0, hi-lo+1)
@@ -288,7 +335,7 @@ func (n *Node) applyLoop() {
 
 		for _, e := range batch {
 			select {
-			case n.applyCh <- e:
+			case n.applyCh <- Apply{Entry: e}:
 			case <-n.ctx.Done():
 				return
 			}
@@ -315,6 +362,6 @@ func (n *Node) becomeFollowerLocked(term uint64, leader NodeID) {
 	n.leader = leader
 	if wasLeader {
 		n.failReadsLocked(ErrNotLeader)
-		n.nextIndex, n.matchIndex, n.wake, n.peerAck = nil, nil, nil, nil
+		n.nextIndex, n.matchIndex, n.wake, n.peerAck, n.snapOff = nil, nil, nil, nil, nil
 	}
 }

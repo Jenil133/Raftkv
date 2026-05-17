@@ -47,6 +47,9 @@ type Server struct {
 	// RequestTimeout caps how long one request may wait on consensus.
 	RequestTimeout time.Duration
 
+	snapshotEvery uint64 // take a snapshot after this many applied entries; 0 = never
+	lastSnapshot  uint64 // index of the newest snapshot (apply loop only)
+
 	mu        sync.Mutex
 	waiters   map[uint64]*waiter
 	applied   uint64
@@ -54,8 +57,15 @@ type Server struct {
 	done      chan struct{}
 }
 
+// Option configures a Server.
+type Option func(*Server)
+
+// WithSnapshotEvery makes the server snapshot its state (letting Raft discard
+// the covered log prefix) every n applied entries.
+func WithSnapshotEvery(n uint64) Option { return func(s *Server) { s.snapshotEvery = n } }
+
 // NewServer starts consuming committed entries from node.
-func NewServer(node *raft.Node) *Server {
+func NewServer(node *raft.Node, opts ...Option) *Server {
 	s := &Server{
 		node:           node,
 		store:          NewStore(),
@@ -63,6 +73,9 @@ func NewServer(node *raft.Node) *Server {
 		waiters:        make(map[uint64]*waiter),
 		appliedCh:      make(chan struct{}),
 		done:           make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	go s.applyLoop()
 	return s
@@ -76,7 +89,12 @@ func (s *Server) Wait() { <-s.done }
 
 func (s *Server) applyLoop() {
 	defer close(s.done)
-	for e := range s.node.Applied() {
+	for ap := range s.node.Applied() {
+		if ap.Snapshot != nil {
+			s.applySnapshot(ap.Snapshot)
+			continue
+		}
+		e := ap.Entry
 		var res Result
 		if e.Type == raft.EntryNormal {
 			var cmd kvpb.Command
@@ -94,10 +112,12 @@ func (s *Server) applyLoop() {
 				w.ch <- applyResult{err: errLostLeadership}
 			}
 		}
-		s.applied = e.Index
-		close(s.appliedCh)
-		s.appliedCh = make(chan struct{})
+		s.advanceApplied(e.Index)
 		s.mu.Unlock()
+
+		if s.snapshotEvery > 0 && e.Index-s.lastSnapshot >= s.snapshotEvery {
+			s.takeSnapshot(e.Index)
+		}
 	}
 	// Node stopped: unblock anyone still waiting.
 	s.mu.Lock()
@@ -106,6 +126,47 @@ func (s *Server) applyLoop() {
 		delete(s.waiters, idx)
 	}
 	s.mu.Unlock()
+}
+
+// advanceApplied records progress and wakes waitApplied callers. mu held.
+func (s *Server) advanceApplied(idx uint64) {
+	s.applied = idx
+	close(s.appliedCh)
+	s.appliedCh = make(chan struct{})
+}
+
+func (s *Server) takeSnapshot(index uint64) {
+	data, err := s.store.Snapshot()
+	if err != nil {
+		panic(fmt.Sprintf("kv: snapshot failed: %v", err))
+	}
+	if err := s.node.Snapshot(index, data); err != nil {
+		if !errors.Is(err, raft.ErrStopped) {
+			panic(fmt.Sprintf("kv: raft snapshot at %d failed: %v", index, err))
+		}
+		return
+	}
+	s.lastSnapshot = index
+}
+
+// applySnapshot replaces the state machine with a snapshot delivered by Raft,
+// either at startup or after the leader sent one to a lagging follower.
+func (s *Server) applySnapshot(snap *raft.Snapshot) {
+	if err := s.store.Restore(snap.Data); err != nil {
+		panic(fmt.Sprintf("kv: corrupt snapshot at index %d: %v", snap.Index, err))
+	}
+	s.mu.Lock()
+	// Anything waiting on an index the snapshot swallowed has an unknown fate
+	// from this node's view; make the client retry (dedupe keeps it safe).
+	for idx, w := range s.waiters {
+		if idx <= snap.Index {
+			delete(s.waiters, idx)
+			w.ch <- applyResult{err: errLostLeadership}
+		}
+	}
+	s.advanceApplied(snap.Index)
+	s.mu.Unlock()
+	s.lastSnapshot = snap.Index
 }
 
 func (s *Server) notLeader() error {

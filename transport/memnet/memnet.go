@@ -195,6 +195,20 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func (e *endpoint) InstallSnapshot(ctx context.Context, to raft.NodeID, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	var reply *raft.InstallSnapshotReply
+	err := e.net.deliver(ctx, e.from, to, func(h raft.Handler) (err error) {
+		a := *args
+		a.Data = append([]byte(nil), args.Data...)
+		reply, err = h.HandleInstallSnapshot(&a)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
 // deliver models request -> handler -> reply with faults on each leg.
 func (n *Network) deliver(ctx context.Context, from, to raft.NodeID, call func(raft.Handler) error) error {
 	h, ok := n.reachable(from, to)
