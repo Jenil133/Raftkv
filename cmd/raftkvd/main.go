@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -48,7 +49,7 @@ func main() {
 		*listen = self
 	}
 	if *dataDir == "" {
-		*dataDir = "data/node" + itoa(*id)
+		*dataDir = "data/node" + strconv.FormatUint(*id, 10)
 	}
 
 	d, err := daemon.Start(daemon.Options{
@@ -72,18 +73,4 @@ func main() {
 	<-sig
 	logger.Info("shutting down")
 	d.Stop()
-}
-
-func itoa(v uint64) string {
-	if v == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for v > 0 {
-		i--
-		b[i] = byte('0' + v%10)
-		v /= 10
-	}
-	return string(b[i:])
 }

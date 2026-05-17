@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -36,6 +35,9 @@ type Client struct {
 
 // NewClient returns a client over the given node endpoints.
 func NewClient(endpoints map[raft.NodeID]kvpb.KVClient) *Client {
+	if len(endpoints) == 0 {
+		panic("kv: NewClient needs at least one endpoint")
+	}
 	order := make([]raft.NodeID, 0, len(endpoints))
 	for id := range endpoints {
 		order = append(order, id)
@@ -215,6 +217,3 @@ func (l local) Delete(ctx context.Context, in *kvpb.DeleteRequest, _ ...grpc.Cal
 func (l local) CAS(ctx context.Context, in *kvpb.CASRequest, _ ...grpc.CallOption) (*kvpb.CASResponse, error) {
 	return l.s.CAS(ctx, in)
 }
-
-// ErrNoEndpoints is returned by helpers that need at least one node.
-var ErrNoEndpoints = errors.New("kv: no endpoints configured")
