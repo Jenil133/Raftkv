@@ -13,16 +13,20 @@ import (
 	"github.com/Jenil133/raftkv/kv"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
+	"github.com/Jenil133/raftkv/shard"
 	"github.com/Jenil133/raftkv/storage"
 	"github.com/Jenil133/raftkv/transport/memnet"
 )
 
-// Member is one node of the cluster. Raft and KV are nil while it is crashed.
+// Member is one node of the cluster. Its groups are nil while it is crashed.
+// Raft and KV are shortcuts for shard 0.
 type Member struct {
-	ID      raft.NodeID
-	Storage raft.Storage
-	Raft    *raft.Node
-	KV      *kv.Server
+	ID       raft.NodeID
+	Storages []raft.Storage // one per shard; survive crashes
+	Groups   []shard.Group
+	Host     *shard.Host
+	Raft     *raft.Node
+	KV       *kv.Server
 }
 
 // Cluster is a set of members sharing a simulated network.
@@ -31,9 +35,12 @@ type Cluster struct {
 	Net *memnet.Network
 	IDs []raft.NodeID
 
+	shards        int
+	snapshotEvery uint64
+	cfg           func(*raft.Config)
+
 	mu      sync.Mutex
 	members map[raft.NodeID]*Member
-	cfg     func(*raft.Config)
 }
 
 // Option customises the cluster.
@@ -44,12 +51,19 @@ func WithRaftConfig(f func(*raft.Config)) Option {
 	return func(c *Cluster) { c.cfg = f }
 }
 
+// WithShards runs n Raft groups per node.
+func WithShards(n int) Option { return func(c *Cluster) { c.shards = n } }
+
+// WithSnapshotEvery enables snapshots/compaction every n applied entries.
+func WithSnapshotEvery(n uint64) Option { return func(c *Cluster) { c.snapshotEvery = n } }
+
 // New starts an n-node cluster and stops it when the test ends.
 func New(t testing.TB, n int, opts ...Option) *Cluster {
 	t.Helper()
 	c := &Cluster{
 		t:       t,
 		Net:     memnet.New(time.Now().UnixNano()),
+		shards:  1,
 		members: make(map[raft.NodeID]*Member),
 	}
 	for _, o := range opts {
@@ -59,57 +73,79 @@ func New(t testing.TB, n int, opts ...Option) *Cluster {
 		c.IDs = append(c.IDs, raft.NodeID(i))
 	}
 	for _, id := range c.IDs {
-		c.members[id] = &Member{ID: id, Storage: storage.NewMemory()}
+		m := &Member{ID: id}
+		for g := 0; g < c.shards; g++ {
+			m.Storages = append(m.Storages, storage.NewMemory())
+		}
+		c.members[id] = m
 		c.startMember(id)
 	}
 	t.Cleanup(c.Shutdown)
 	return c
 }
 
+// Shards returns the number of Raft groups per node.
+func (c *Cluster) Shards() int { return c.shards }
+
 func (c *Cluster) startMember(id raft.NodeID) {
 	m := c.members[id]
-	cfg := raft.Config{
-		ID:                 id,
-		Peers:              c.IDs,
-		Transport:          c.Net.Endpoint(id),
-		Storage:            m.Storage,
-		ElectionTimeoutMin: 100 * time.Millisecond,
-		ElectionTimeoutMax: 200 * time.Millisecond,
-		HeartbeatInterval:  20 * time.Millisecond,
+	groups := make([]shard.Group, c.shards)
+	for g := 0; g < c.shards; g++ {
+		cfg := raft.Config{
+			ID:                 id,
+			Peers:              c.IDs,
+			Transport:          c.Net.EndpointGroup(uint32(g), id),
+			Storage:            m.Storages[g],
+			ElectionTimeoutMin: 100 * time.Millisecond,
+			ElectionTimeoutMax: 200 * time.Millisecond,
+			HeartbeatInterval:  20 * time.Millisecond,
+		}
+		if c.cfg != nil {
+			c.cfg(&cfg)
+		}
+		node, err := raft.NewNode(cfg)
+		if err != nil {
+			c.t.Fatalf("new node %d shard %d: %v", id, g, err)
+		}
+		var opts []kv.Option
+		if c.snapshotEvery > 0 {
+			opts = append(opts, kv.WithSnapshotEvery(c.snapshotEvery))
+		}
+		groups[g] = shard.Group{Raft: node, KV: kv.NewServer(node, opts...)}
 	}
-	if c.cfg != nil {
-		c.cfg(&cfg)
+	m.Groups = groups
+	m.Host = shard.NewHost(groups)
+	m.Raft, m.KV = groups[0].Raft, groups[0].KV
+	for g, grp := range groups {
+		c.Net.RegisterGroup(uint32(g), id, grp.Raft)
+		grp.Raft.Start()
 	}
-	node, err := raft.NewNode(cfg)
-	if err != nil {
-		c.t.Fatalf("new node %d: %v", id, err)
-	}
-	m.Raft = node
-	m.KV = kv.NewServer(node)
-	c.Net.Register(id, node)
-	node.Start()
 }
 
 // Crash stops a node but keeps its storage, like a process kill.
 func (c *Cluster) Crash(id raft.NodeID) {
 	c.mu.Lock()
 	m := c.members[id]
-	node, srv := m.Raft, m.KV
-	m.Raft, m.KV = nil, nil
+	groups := m.Groups
+	m.Groups, m.Host, m.Raft, m.KV = nil, nil, nil, nil
 	c.mu.Unlock()
-	if node == nil {
+	if groups == nil {
 		return
 	}
 	c.Net.Unregister(id)
-	node.Stop()
-	srv.Wait()
+	for _, g := range groups {
+		g.Raft.Stop()
+	}
+	for _, g := range groups {
+		g.KV.Wait()
+	}
 }
 
 // Restart boots a crashed node from its storage.
 func (c *Cluster) Restart(id raft.NodeID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.members[id].Raft != nil {
+	if c.members[id].Groups != nil {
 		return
 	}
 	c.startMember(id)
@@ -122,7 +158,7 @@ func (c *Cluster) Shutdown() {
 	}
 }
 
-// Member returns the member record (fields may be nil if crashed).
+// Member returns the member record (group fields are nil if crashed).
 func (c *Cluster) Member(id raft.NodeID) Member {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -130,22 +166,47 @@ func (c *Cluster) Member(id raft.NodeID) Member {
 }
 
 // Up reports whether id is running.
-func (c *Cluster) Up(id raft.NodeID) bool { return c.Member(id).Raft != nil }
+func (c *Cluster) Up(id raft.NodeID) bool { return c.Member(id).Groups != nil }
 
-// Leaders returns running nodes that currently believe they lead.
-func (c *Cluster) Leaders() []raft.NodeID {
+// Node returns the Raft node for (id, shard), or nil if crashed.
+func (c *Cluster) Node(id raft.NodeID, g int) *raft.Node {
+	if m := c.Member(id); m.Groups != nil {
+		return m.Groups[g].Raft
+	}
+	return nil
+}
+
+// Server returns the KV server for (id, shard), or nil if crashed.
+func (c *Cluster) Server(id raft.NodeID, g int) *kv.Server {
+	if m := c.Member(id); m.Groups != nil {
+		return m.Groups[g].KV
+	}
+	return nil
+}
+
+// Leaders returns running nodes that believe they lead shard 0.
+func (c *Cluster) Leaders() []raft.NodeID { return c.LeadersOf(0) }
+
+// LeadersOf returns running nodes that believe they lead shard g.
+func (c *Cluster) LeadersOf(g int) []raft.NodeID {
 	var out []raft.NodeID
 	for _, id := range c.IDs {
-		if m := c.Member(id); m.Raft != nil && m.Raft.Status().Role == raft.Leader {
+		if n := c.Node(id, g); n != nil && n.Status().Role == raft.Leader {
 			out = append(out, id)
 		}
 	}
 	return out
 }
 
-// WaitLeader waits for exactly one leader among nodes (all running nodes if
-// none given) and returns it.
+// WaitLeader waits for exactly one shard-0 leader among nodes (all if none
+// given) and returns it.
 func (c *Cluster) WaitLeader(timeout time.Duration, among ...raft.NodeID) raft.NodeID {
+	c.t.Helper()
+	return c.WaitLeaderOf(0, timeout, among...)
+}
+
+// WaitLeaderOf is WaitLeader for shard g.
+func (c *Cluster) WaitLeaderOf(g int, timeout time.Duration, among ...raft.NodeID) raft.NodeID {
 	c.t.Helper()
 	if len(among) == 0 {
 		among = c.IDs
@@ -154,22 +215,30 @@ func (c *Cluster) WaitLeader(timeout time.Duration, among ...raft.NodeID) raft.N
 	for time.Now().Before(deadline) {
 		var leaders []raft.NodeID
 		for _, id := range among {
-			if m := c.Member(id); m.Raft != nil && m.Raft.Status().Role == raft.Leader {
+			if n := c.Node(id, g); n != nil && n.Status().Role == raft.Leader {
 				leaders = append(leaders, id)
 			}
 		}
-		// Stale leaders in older terms can briefly coexist; require one in the
-		// highest term.
-		if best := highestTermLeader(c, leaders); best != 0 {
+		// Stale leaders in older terms can briefly coexist; require exactly
+		// one in the highest term.
+		if best := highestTermLeader(c, g, leaders); best != 0 {
 			return best
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	c.t.Fatalf("no leader elected within %v", timeout)
+	c.t.Fatalf("shard %d: no leader elected within %v", g, timeout)
 	return 0
 }
 
-func highestTermLeader(c *Cluster, leaders []raft.NodeID) raft.NodeID {
+// WaitAllLeaders waits until every shard has a leader.
+func (c *Cluster) WaitAllLeaders(timeout time.Duration) {
+	c.t.Helper()
+	for g := 0; g < c.shards; g++ {
+		c.WaitLeaderOf(g, timeout)
+	}
+}
+
+func highestTermLeader(c *Cluster, g int, leaders []raft.NodeID) raft.NodeID {
 	if len(leaders) == 0 {
 		return 0
 	}
@@ -177,7 +246,11 @@ func highestTermLeader(c *Cluster, leaders []raft.NodeID) raft.NodeID {
 	var bestTerm uint64
 	count := 0
 	for _, id := range leaders {
-		st := c.Member(id).Raft.Status()
+		n := c.Node(id, g)
+		if n == nil {
+			continue
+		}
+		st := n.Status()
 		switch {
 		case st.Term > bestTerm:
 			best, bestTerm, count = id, st.Term, 1
@@ -204,15 +277,29 @@ func (c *Cluster) Eventually(timeout time.Duration, msg string, cond func() bool
 	c.t.Fatalf("timed out waiting for: %s", msg)
 }
 
-// Client returns a KV client that talks to the nodes directly (no network
-// faults between client and node), tracking crashes.
-func (c *Cluster) Client() *kv.Client {
+func (c *Cluster) endpoints() map[raft.NodeID]kvpb.KVClient {
 	eps := make(map[raft.NodeID]kvpb.KVClient, len(c.IDs))
 	for _, id := range c.IDs {
 		eps[id] = &endpoint{c: c, id: id}
 	}
-	cl := kv.NewClient(eps)
+	return eps
+}
+
+// Client returns a KV client that talks to the nodes directly (no network
+// faults between client and node), tracking crashes. With several shards it
+// still works but bounces between shard leaders; prefer ShardClient.
+func (c *Cluster) Client() *kv.Client {
+	cl := kv.NewClient(c.endpoints())
 	cl.AttemptTimeout = time.Second
+	return cl
+}
+
+// ShardClient returns a shard-routing client.
+func (c *Cluster) ShardClient() *shard.Client {
+	cl := shard.NewClient(c.endpoints(), c.shards)
+	for _, s := range cl.Shards() {
+		s.AttemptTimeout = time.Second
+	}
 	return cl
 }
 
@@ -221,41 +308,49 @@ type endpoint struct {
 	id raft.NodeID
 }
 
-func (e *endpoint) srv() (*kv.Server, error) {
-	if m := e.c.Member(e.id); m.KV != nil {
-		return m.KV, nil
+func (e *endpoint) host() (*shard.Host, error) {
+	if m := e.c.Member(e.id); m.Host != nil {
+		return m.Host, nil
 	}
 	return nil, fmt.Errorf("node %d is down", e.id)
 }
 
 func (e *endpoint) Put(ctx context.Context, in *kvpb.PutRequest, _ ...grpc.CallOption) (*kvpb.PutResponse, error) {
-	s, err := e.srv()
+	h, err := e.host()
 	if err != nil {
 		return nil, err
 	}
-	return s.Put(ctx, in)
+	return h.Put(ctx, in)
 }
 
 func (e *endpoint) Get(ctx context.Context, in *kvpb.GetRequest, _ ...grpc.CallOption) (*kvpb.GetResponse, error) {
-	s, err := e.srv()
+	h, err := e.host()
 	if err != nil {
 		return nil, err
 	}
-	return s.Get(ctx, in)
+	return h.Get(ctx, in)
 }
 
 func (e *endpoint) Delete(ctx context.Context, in *kvpb.DeleteRequest, _ ...grpc.CallOption) (*kvpb.DeleteResponse, error) {
-	s, err := e.srv()
+	h, err := e.host()
 	if err != nil {
 		return nil, err
 	}
-	return s.Delete(ctx, in)
+	return h.Delete(ctx, in)
 }
 
 func (e *endpoint) CAS(ctx context.Context, in *kvpb.CASRequest, _ ...grpc.CallOption) (*kvpb.CASResponse, error) {
-	s, err := e.srv()
+	h, err := e.host()
 	if err != nil {
 		return nil, err
 	}
-	return s.CAS(ctx, in)
+	return h.CAS(ctx, in)
+}
+
+func (e *endpoint) Scan(ctx context.Context, in *kvpb.ScanRequest, _ ...grpc.CallOption) (*kvpb.ScanResponse, error) {
+	h, err := e.host()
+	if err != nil {
+		return nil, err
+	}
+	return h.Scan(ctx, in)
 }

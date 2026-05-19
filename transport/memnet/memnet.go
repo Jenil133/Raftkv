@@ -17,10 +17,17 @@ var ErrUnreachable = errors.New("memnet: unreachable")
 
 type link struct{ from, to raft.NodeID }
 
+// hkey addresses one Raft group on one node. Several groups (shards) can share
+// a node, and faults apply to the node, hence to all its groups.
+type hkey struct {
+	group uint32
+	node  raft.NodeID
+}
+
 // Network connects registered handlers.
 type Network struct {
 	mu       sync.RWMutex
-	handlers map[raft.NodeID]raft.Handler
+	handlers map[hkey]raft.Handler
 	blocked  map[link]bool
 	isolated map[raft.NodeID]bool
 	dropRate float64
@@ -33,24 +40,32 @@ type Network struct {
 // New returns a network whose randomness is seeded with seed.
 func New(seed int64) *Network {
 	return &Network{
-		handlers: make(map[raft.NodeID]raft.Handler),
+		handlers: make(map[hkey]raft.Handler),
 		blocked:  make(map[link]bool),
 		isolated: make(map[raft.NodeID]bool),
 		rng:      rand.New(rand.NewSource(seed)),
 	}
 }
 
-// Register attaches h as the receiver for id, replacing any previous one.
-func (n *Network) Register(id raft.NodeID, h raft.Handler) {
+// Register attaches h as the receiver for id in group 0.
+func (n *Network) Register(id raft.NodeID, h raft.Handler) { n.RegisterGroup(0, id, h) }
+
+// RegisterGroup attaches h as the receiver for id in the given group,
+// replacing any previous one.
+func (n *Network) RegisterGroup(group uint32, id raft.NodeID, h raft.Handler) {
 	n.mu.Lock()
-	n.handlers[id] = h
+	n.handlers[hkey{group, id}] = h
 	n.mu.Unlock()
 }
 
-// Unregister detaches id; calls to it fail (a crashed node).
+// Unregister detaches id from every group; calls to it fail (a crashed node).
 func (n *Network) Unregister(id raft.NodeID) {
 	n.mu.Lock()
-	delete(n.handlers, id)
+	for k := range n.handlers {
+		if k.node == id {
+			delete(n.handlers, k)
+		}
+	}
 	n.mu.Unlock()
 }
 
@@ -116,19 +131,23 @@ func (n *Network) SetDelay(min, max time.Duration) {
 	n.mu.Unlock()
 }
 
-// Endpoint returns the raft.Transport that node from uses.
-func (n *Network) Endpoint(from raft.NodeID) raft.Transport {
-	return &endpoint{net: n, from: from}
+// Endpoint returns the group-0 raft.Transport that node from uses.
+func (n *Network) Endpoint(from raft.NodeID) raft.Transport { return n.EndpointGroup(0, from) }
+
+// EndpointGroup returns the raft.Transport node from uses for one group.
+func (n *Network) EndpointGroup(group uint32, from raft.NodeID) raft.Transport {
+	return &endpoint{net: n, from: from, group: group}
 }
 
 type endpoint struct {
-	net  *Network
-	from raft.NodeID
+	net   *Network
+	from  raft.NodeID
+	group uint32
 }
 
 func (e *endpoint) RequestVote(ctx context.Context, to raft.NodeID, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
 	var reply *raft.RequestVoteReply
-	err := e.net.deliver(ctx, e.from, to, func(h raft.Handler) (err error) {
+	err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (err error) {
 		a := *args
 		reply, err = h.HandleRequestVote(&a)
 		return err
@@ -141,7 +160,7 @@ func (e *endpoint) RequestVote(ctx context.Context, to raft.NodeID, args *raft.R
 
 func (e *endpoint) AppendEntries(ctx context.Context, to raft.NodeID, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	var reply *raft.AppendEntriesReply
-	err := e.net.deliver(ctx, e.from, to, func(h raft.Handler) (err error) {
+	err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (err error) {
 		a := *args
 		a.Entries = append([]raft.Entry(nil), args.Entries...)
 		reply, err = h.HandleAppendEntries(&a)
@@ -153,10 +172,10 @@ func (e *endpoint) AppendEntries(ctx context.Context, to raft.NodeID, args *raft
 	return reply, nil
 }
 
-func (n *Network) reachable(from, to raft.NodeID) (raft.Handler, bool) {
+func (n *Network) reachable(group uint32, from, to raft.NodeID) (raft.Handler, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	h, ok := n.handlers[to]
+	h, ok := n.handlers[hkey{group, to}]
 	if !ok || n.isolated[from] || n.isolated[to] || n.blocked[link{from, to}] {
 		return nil, false
 	}
@@ -197,7 +216,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 
 func (e *endpoint) InstallSnapshot(ctx context.Context, to raft.NodeID, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
 	var reply *raft.InstallSnapshotReply
-	err := e.net.deliver(ctx, e.from, to, func(h raft.Handler) (err error) {
+	err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (err error) {
 		a := *args
 		a.Data = append([]byte(nil), args.Data...)
 		reply, err = h.HandleInstallSnapshot(&a)
@@ -210,8 +229,8 @@ func (e *endpoint) InstallSnapshot(ctx context.Context, to raft.NodeID, args *ra
 }
 
 // deliver models request -> handler -> reply with faults on each leg.
-func (n *Network) deliver(ctx context.Context, from, to raft.NodeID, call func(raft.Handler) error) error {
-	h, ok := n.reachable(from, to)
+func (n *Network) deliver(ctx context.Context, group uint32, from, to raft.NodeID, call func(raft.Handler) error) error {
+	h, ok := n.reachable(group, from, to)
 	if !ok {
 		return ErrUnreachable
 	}
@@ -222,7 +241,7 @@ func (n *Network) deliver(ctx context.Context, from, to raft.NodeID, call func(r
 	if err := sleep(ctx, delay); err != nil {
 		return err
 	}
-	if h, ok = n.reachable(from, to); !ok {
+	if h, ok = n.reachable(group, from, to); !ok {
 		return ErrUnreachable
 	}
 	if err := call(h); err != nil {
@@ -236,7 +255,7 @@ func (n *Network) deliver(ctx context.Context, from, to raft.NodeID, call func(r
 	if err := sleep(ctx, delay); err != nil {
 		return err
 	}
-	if _, ok = n.reachable(to, from); !ok {
+	if _, ok = n.reachable(group, to, from); !ok {
 		return ErrUnreachable
 	}
 	return nil

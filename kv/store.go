@@ -4,6 +4,7 @@ package kv
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
@@ -77,6 +78,10 @@ func (s *Store) execute(cmd *kvpb.Command) Result {
 			match = exists && bytes.Equal(cur, cmd.Expected)
 		}
 		if match {
+			if cmd.DeleteOnMatch {
+				delete(s.data, cmd.Key)
+				return Result{Swapped: true}
+			}
 			s.data[cmd.Key] = append([]byte(nil), cmd.Value...)
 			return Result{Found: true, Value: append([]byte(nil), cmd.Value...), Swapped: true}
 		}
@@ -145,6 +150,28 @@ func (s *Store) Restore(data []byte) error {
 		s.sessions[id] = session{seq: st.Seq, result: Result{Found: st.Found, Value: st.Value, Swapped: st.Swapped}}
 	}
 	return nil
+}
+
+// Scan returns up to limit key/value pairs with the given prefix and a key
+// strictly greater than after, in key order. limit <= 0 means no limit.
+func (s *Store) Scan(prefix, after string, limit int) []*kvpb.Pair {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var keys []string
+	for k := range s.data {
+		if strings.HasPrefix(k, prefix) && k > after {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	out := make([]*kvpb.Pair, len(keys))
+	for i, k := range keys {
+		out[i] = &kvpb.Pair{Key: k, Value: append([]byte(nil), s.data[k]...)}
+	}
+	return out
 }
 
 // Keys returns all keys in sorted order.

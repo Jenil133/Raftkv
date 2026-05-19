@@ -11,9 +11,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/Jenil133/raftkv/kv"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
+	"github.com/Jenil133/raftkv/shard"
 )
 
 // gcluster is a 3-node cluster talking real gRPC over loopback with WALs on disk.
@@ -22,11 +22,17 @@ type gcluster struct {
 	dir   string
 	addrs map[raft.NodeID]string
 	nodes map[raft.NodeID]*Daemon
+
+	shards    int
+	snapEvery uint64
 }
 
-func newGRPCCluster(t *testing.T, n int) *gcluster {
+func newGRPCCluster(t *testing.T, n, shards int, snapEvery uint64) *gcluster {
 	t.Helper()
-	g := &gcluster{t: t, dir: t.TempDir(), addrs: map[raft.NodeID]string{}, nodes: map[raft.NodeID]*Daemon{}}
+	g := &gcluster{
+		t: t, dir: t.TempDir(), shards: shards, snapEvery: snapEvery,
+		addrs: map[raft.NodeID]string{}, nodes: map[raft.NodeID]*Daemon{},
+	}
 	lis := map[raft.NodeID]net.Listener{}
 	for i := 1; i <= n; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -55,6 +61,8 @@ func (g *gcluster) start(id raft.NodeID, l net.Listener) {
 		Listen:             g.addrs[id],
 		Peers:              g.addrs,
 		DataDir:            filepath.Join(g.dir, fmt.Sprintf("node%d", id)),
+		Shards:             g.shards,
+		SnapshotEvery:      g.snapEvery,
 		NoSync:             true,
 		ElectionTimeoutMin: 150 * time.Millisecond,
 		HeartbeatInterval:  25 * time.Millisecond,
@@ -80,23 +88,33 @@ func (g *gcluster) restart(id raft.NodeID) {
 	g.start(id, l)
 }
 
-func (g *gcluster) client() *kv.Client {
-	eps := map[raft.NodeID]kvpb.KVClient{}
+func (g *gcluster) conns() map[raft.NodeID]*grpc.ClientConn {
+	out := map[raft.NodeID]*grpc.ClientConn{}
 	for id, addr := range g.addrs {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			g.t.Fatal(err)
 		}
 		g.t.Cleanup(func() { conn.Close() })
+		out[id] = conn
+	}
+	return out
+}
+
+func (g *gcluster) client() *shard.Client {
+	eps := map[raft.NodeID]kvpb.KVClient{}
+	for id, conn := range g.conns() {
 		eps[id] = kvpb.NewKVClient(conn)
 	}
-	cl := kv.NewClient(eps)
-	cl.AttemptTimeout = time.Second
+	cl := shard.NewClient(eps, g.shards)
+	for _, s := range cl.Shards() {
+		s.AttemptTimeout = time.Second
+	}
 	return cl
 }
 
 func TestGRPCClusterEndToEnd(t *testing.T) {
-	g := newGRPCCluster(t, 3)
+	g := newGRPCCluster(t, 3, 1, 0)
 	cl := g.client()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -124,7 +142,7 @@ func TestGRPCClusterEndToEnd(t *testing.T) {
 	// Kill the leader node; the cluster keeps serving.
 	var leader raft.NodeID
 	for id, d := range g.nodes {
-		if d.Raft.Status().Role == raft.Leader {
+		if d.Shard(0).Raft.Status().Role == raft.Leader {
 			leader = id
 		}
 	}
@@ -137,7 +155,7 @@ func TestGRPCClusterEndToEnd(t *testing.T) {
 	g.restart(leader)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		d := g.nodes[leader].KV.Store().Dump()
+		d := g.nodes[leader].Shard(0).KV.Store().Dump()
 		if d["after-failover"] == "ok" && d["k7"] == "new" && len(d) == 20 { // 20 - k8 + after-failover
 			break
 		}

@@ -274,6 +274,24 @@ func classify(err error) (kvpb.Status, uint64, string) {
 	}
 }
 
+// Scan returns a linearizable view of this group's keys under a prefix.
+func (s *Server) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanResponse, error) {
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	idx, err := s.node.ReadIndex(ctx)
+	if err == nil {
+		err = s.waitApplied(ctx, idx)
+	} else if errors.Is(err, raft.ErrNotLeader) {
+		err = s.notLeader()
+	}
+	st, hint, msg := classify(err)
+	resp := &kvpb.ScanResponse{Status: st, LeaderHint: hint, Error: msg}
+	if err == nil {
+		resp.Pairs = s.store.Scan(req.Prefix, req.After, int(req.Limit))
+	}
+	return resp, nil
+}
+
 func (s *Server) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResponse, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
@@ -307,7 +325,8 @@ func (s *Server) CAS(ctx context.Context, req *kvpb.CASRequest) (*kvpb.CASRespon
 	defer cancel()
 	res, err := s.execute(ctx, &kvpb.Command{
 		Op: kvpb.Op_CAS, Key: req.Key, Value: req.Value, Expected: req.Expected,
-		ExpectAbsent: req.ExpectAbsent, ClientId: req.ClientId, Seq: req.Seq,
+		ExpectAbsent: req.ExpectAbsent, DeleteOnMatch: req.DeleteOnMatch,
+		ClientId: req.ClientId, Seq: req.Seq,
 	})
 	st, hint, msg := classify(err)
 	return &kvpb.CASResponse{

@@ -1,11 +1,13 @@
-// Package daemon assembles one production node: WAL storage, gRPC transport,
-// Raft node, KV server, and the gRPC listener that serves both.
+// Package daemon assembles one production node: per-shard WAL storage, gRPC
+// transport, Raft groups, KV servers, and the gRPC listener that serves the
+// Raft and KV APIs.
 package daemon
 
 import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/grpc"
@@ -13,6 +15,7 @@ import (
 	"github.com/Jenil133/raftkv/kv"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
+	"github.com/Jenil133/raftkv/shard"
 	"github.com/Jenil133/raftkv/storage"
 	"github.com/Jenil133/raftkv/transport/grpctransport"
 )
@@ -24,6 +27,11 @@ type Options struct {
 	Listen   string
 	Peers    map[raft.NodeID]string // every node's address, including this one
 	DataDir  string
+	// Shards is the number of Raft groups; it must match on every node.
+	Shards int
+	// SnapshotEvery snapshots each shard after this many applied entries
+	// (0 disables compaction).
+	SnapshotEvery uint64
 	// NoSync disables fsync (benchmarks/tests only).
 	NoSync bool
 
@@ -34,20 +42,25 @@ type Options struct {
 
 // Daemon is a running node.
 type Daemon struct {
-	Raft *raft.Node
-	KV   *kv.Server
+	Host *shard.Host
 
 	grpc      *grpc.Server
 	transport *grpctransport.Transport
-	wal       *storage.WAL
+	wals      []*storage.WAL
 	lis       net.Listener
 	serveDone chan struct{}
 }
+
+// Shard returns the replica of shard g on this node.
+func (d *Daemon) Shard(g int) shard.Group { return d.Host.Groups[g] }
 
 // Start boots the node and begins serving.
 func Start(o Options) (*Daemon, error) {
 	if _, ok := o.Peers[o.ID]; !ok {
 		return nil, fmt.Errorf("daemon: node %d missing from peers", o.ID)
+	}
+	if o.Shards < 1 {
+		o.Shards = 1
 	}
 	lis := o.Listener
 	if lis == nil {
@@ -56,48 +69,77 @@ func Start(o Options) (*Daemon, error) {
 			return nil, err
 		}
 	}
-	wal, err := storage.OpenWAL(o.DataDir)
-	if err != nil {
+
+	d := &Daemon{lis: lis, serveDone: make(chan struct{})}
+	fail := func(err error) (*Daemon, error) {
+		for _, g := range d.groups() {
+			g.Raft.Stop()
+			g.KV.Wait()
+		}
+		for _, w := range d.wals {
+			w.Close()
+		}
+		if d.transport != nil {
+			d.transport.Close()
+		}
 		lis.Close()
 		return nil, err
 	}
-	wal.NoSync = o.NoSync
 
 	ids := make([]raft.NodeID, 0, len(o.Peers))
 	for id := range o.Peers {
 		ids = append(ids, id)
 	}
-	tr := grpctransport.New(o.Peers)
-	node, err := raft.NewNode(raft.Config{
-		ID:                 o.ID,
-		Peers:              ids,
-		Transport:          tr,
-		Storage:            wal,
-		ElectionTimeoutMin: o.ElectionTimeoutMin,
-		HeartbeatInterval:  o.HeartbeatInterval,
-		Logger:             o.Logger,
-	})
-	if err != nil {
-		wal.Close()
-		lis.Close()
-		return nil, err
-	}
+	d.transport = grpctransport.New(o.Peers)
+	d.grpc = grpc.NewServer()
+	router := grpctransport.Register(d.grpc)
 
-	srv := kv.NewServer(node)
-	gs := grpc.NewServer()
-	grpctransport.Register(gs, node)
-	kvpb.RegisterKVServer(gs, srv)
+	groups := make([]shard.Group, o.Shards)
+	for g := 0; g < o.Shards; g++ {
+		wal, err := storage.OpenWAL(filepath.Join(o.DataDir, fmt.Sprintf("shard%d", g)))
+		if err != nil {
+			return fail(err)
+		}
+		wal.NoSync = o.NoSync
+		d.wals = append(d.wals, wal)
 
-	d := &Daemon{
-		Raft: node, KV: srv, grpc: gs, transport: tr, wal: wal, lis: lis,
-		serveDone: make(chan struct{}),
+		node, err := raft.NewNode(raft.Config{
+			ID:                 o.ID,
+			Peers:              ids,
+			Transport:          d.transport.Group(uint32(g)),
+			Storage:            wal,
+			ElectionTimeoutMin: o.ElectionTimeoutMin,
+			HeartbeatInterval:  o.HeartbeatInterval,
+			Logger:             o.Logger,
+		})
+		if err != nil {
+			return fail(err)
+		}
+		var kvOpts []kv.Option
+		if o.SnapshotEvery > 0 {
+			kvOpts = append(kvOpts, kv.WithSnapshotEvery(o.SnapshotEvery))
+		}
+		groups[g] = shard.Group{Raft: node, KV: kv.NewServer(node, kvOpts...)}
+		router.Handle(uint32(g), node)
 	}
-	node.Start()
+	d.Host = shard.NewHost(groups)
+	kvpb.RegisterKVServer(d.grpc, d.Host)
+
+	for _, g := range groups {
+		g.Raft.Start()
+	}
 	go func() {
 		defer close(d.serveDone)
-		gs.Serve(lis)
+		d.grpc.Serve(lis)
 	}()
 	return d, nil
+}
+
+func (d *Daemon) groups() []shard.Group {
+	if d.Host == nil {
+		return nil
+	}
+	return d.Host.Groups
 }
 
 // Addr is the address the node is listening on.
@@ -107,8 +149,14 @@ func (d *Daemon) Addr() string { return d.lis.Addr().String() }
 func (d *Daemon) Stop() {
 	d.grpc.Stop()
 	<-d.serveDone
-	d.Raft.Stop()
-	d.KV.Wait()
+	for _, g := range d.Host.Groups {
+		g.Raft.Stop()
+	}
+	for _, g := range d.Host.Groups {
+		g.KV.Wait()
+	}
 	d.transport.Close()
-	d.wal.Close()
+	for _, w := range d.wals {
+		w.Close()
+	}
 }

@@ -21,6 +21,8 @@ func main() {
 		peers     = flag.String("peers", "", "cluster members as id=host:port,id=host:port,...")
 		listen    = flag.String("listen", "", "address to listen on (default: this node's address from -peers)")
 		dataDir   = flag.String("data", "", "directory for the write-ahead log (default: ./data/node<id>)")
+		shards    = flag.Int("shards", 4, "number of Raft groups (must match on every node)")
+		snapEvery = flag.Uint64("snapshot-every", 10000, "snapshot each shard after this many applied entries (0 disables)")
 		noSync    = flag.Bool("no-sync", false, "skip fsync (unsafe; benchmarks only)")
 		election  = flag.Duration("election-timeout", 300*time.Millisecond, "minimum election timeout")
 		heartbeat = flag.Duration("heartbeat", 50*time.Millisecond, "leader heartbeat interval")
@@ -57,6 +59,8 @@ func main() {
 		Listen:             *listen,
 		Peers:              addrs,
 		DataDir:            *dataDir,
+		Shards:             *shards,
+		SnapshotEvery:      *snapEvery,
 		NoSync:             *noSync,
 		ElectionTimeoutMin: *election,
 		HeartbeatInterval:  *heartbeat,

@@ -25,6 +25,9 @@ type Client struct {
 	id        uint64
 	// AttemptTimeout bounds a single RPC attempt.
 	AttemptTimeout time.Duration
+	// Shard is the Raft group this client talks to; Scan needs it because a
+	// scan cannot be routed by key.
+	Shard uint32
 
 	writeMu sync.Mutex // serialises writes so seq order matches issue order
 	mu      sync.Mutex
@@ -181,12 +184,35 @@ func (c *Client) Delete(ctx context.Context, key string) (existed bool, err erro
 // is true it instead requires the key to not exist. It returns whether the swap
 // happened and the value the key holds afterwards.
 func (c *Client) CAS(ctx context.Context, key string, expected []byte, expectAbsent bool, value []byte) (swapped bool, current []byte, err error) {
+	return c.cas(ctx, &kvpb.CASRequest{Key: key, Expected: expected, ExpectAbsent: expectAbsent, Value: value})
+}
+
+// CASDelete deletes key if its current value equals expected. It reports
+// whether the delete happened and the value the key held if it did not.
+func (c *Client) CASDelete(ctx context.Context, key string, expected []byte) (deleted bool, current []byte, err error) {
+	return c.cas(ctx, &kvpb.CASRequest{Key: key, Expected: expected, DeleteOnMatch: true})
+}
+
+// Scan returns up to limit pairs under prefix with key > after, from this
+// client's shard, in key order.
+func (c *Client) Scan(ctx context.Context, prefix, after string, limit int) ([]*kvpb.Pair, error) {
+	var pairs []*kvpb.Pair
+	req := &kvpb.ScanRequest{Shard: c.Shard, Prefix: prefix, After: after, Limit: uint32(limit)}
+	err := c.do(ctx, func(ctx context.Context, ep kvpb.KVClient) (outcome, error) {
+		r, err := ep.Scan(ctx, req)
+		if err != nil {
+			return outcome{}, err
+		}
+		pairs = r.Pairs
+		return outcome{r.Status, r.LeaderHint, r.Error}, nil
+	})
+	return pairs, err
+}
+
+func (c *Client) cas(ctx context.Context, req *kvpb.CASRequest) (swapped bool, current []byte, err error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	req := &kvpb.CASRequest{
-		Key: key, Expected: expected, ExpectAbsent: expectAbsent, Value: value,
-		ClientId: c.id, Seq: c.nextSeq(),
-	}
+	req.ClientId, req.Seq = c.id, c.nextSeq()
 	err = c.do(ctx, func(ctx context.Context, ep kvpb.KVClient) (outcome, error) {
 		r, err := ep.CAS(ctx, req)
 		if err != nil {
@@ -216,4 +242,7 @@ func (l local) Delete(ctx context.Context, in *kvpb.DeleteRequest, _ ...grpc.Cal
 }
 func (l local) CAS(ctx context.Context, in *kvpb.CASRequest, _ ...grpc.CallOption) (*kvpb.CASResponse, error) {
 	return l.s.CAS(ctx, in)
+}
+func (l local) Scan(ctx context.Context, in *kvpb.ScanRequest, _ ...grpc.CallOption) (*kvpb.ScanResponse, error) {
+	return l.s.Scan(ctx, in)
 }

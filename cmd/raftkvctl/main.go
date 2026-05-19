@@ -6,14 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/Jenil133/raftkv/kv"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
+	"github.com/Jenil133/raftkv/shard"
 	"github.com/Jenil133/raftkv/transport/grpctransport"
 )
 
@@ -25,11 +26,13 @@ commands:
   del <key>
   cas <key> <expected> <value>     set value if current value equals expected
   cas-absent <key> <value>         set value only if key does not exist
+  scan <prefix> [limit]            list keys under a prefix across all shards
 `
 
 func main() {
 	endpoints := flag.String("endpoints", "1=127.0.0.1:7001", "cluster members as id=host:port,...")
 	timeout := flag.Duration("timeout", 10*time.Second, "overall request timeout")
+	shards := flag.Int("shards", 4, "number of shards the cluster runs (must match raftkvd -shards)")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage); flag.PrintDefaults() }
 	flag.Parse()
 	args := flag.Args()
@@ -51,7 +54,7 @@ func main() {
 		defer conn.Close()
 		eps[id] = kvpb.NewKVClient(conn)
 	}
-	cl := kv.NewClient(eps)
+	cl := shard.NewClient(eps, *shards)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
@@ -90,10 +93,31 @@ func main() {
 		swapped, cur, err := cl.CAS(ctx, args[1], nil, true, []byte(args[2]))
 		check(err)
 		fmt.Printf("swapped: %v current: %q\n", swapped, cur)
+	case "scan":
+		if len(args) < 2 || len(args) > 3 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		pairs, err := cl.Scan(ctx, args[1], "", limitArg(args, 2))
+		check(err)
+		for _, p := range pairs {
+			fmt.Printf("%s = %s\n", p.Key, p.Value)
+		}
 	default:
 		flag.Usage()
 		os.Exit(2)
 	}
+}
+
+func limitArg(args []string, i int) int {
+	if len(args) <= i {
+		return 100
+	}
+	n, err := strconv.Atoi(args[i])
+	if err != nil || n <= 0 {
+		fatal(fmt.Errorf("bad limit %q", args[i]))
+	}
+	return n
 }
 
 func check(err error) {

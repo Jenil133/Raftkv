@@ -64,7 +64,42 @@ func (t *Transport) Close() {
 	}
 }
 
+// Group returns a raft.Transport that tags every RPC with a Raft group id so a
+// single connection set can carry several groups (shards).
+func (t *Transport) Group(group uint32) raft.Transport { return &groupTransport{t: t, group: group} }
+
+// RequestVote, AppendEntries and InstallSnapshot make Transport itself the
+// transport for group 0.
 func (t *Transport) RequestVote(ctx context.Context, to raft.NodeID, a *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
+	return t.requestVote(ctx, 0, to, a)
+}
+
+func (t *Transport) AppendEntries(ctx context.Context, to raft.NodeID, a *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+	return t.appendEntries(ctx, 0, to, a)
+}
+
+func (t *Transport) InstallSnapshot(ctx context.Context, to raft.NodeID, a *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	return t.installSnapshot(ctx, 0, to, a)
+}
+
+type groupTransport struct {
+	t     *Transport
+	group uint32
+}
+
+func (g *groupTransport) RequestVote(ctx context.Context, to raft.NodeID, a *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
+	return g.t.requestVote(ctx, g.group, to, a)
+}
+
+func (g *groupTransport) AppendEntries(ctx context.Context, to raft.NodeID, a *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+	return g.t.appendEntries(ctx, g.group, to, a)
+}
+
+func (g *groupTransport) InstallSnapshot(ctx context.Context, to raft.NodeID, a *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	return g.t.installSnapshot(ctx, g.group, to, a)
+}
+
+func (t *Transport) requestVote(ctx context.Context, group uint32, to raft.NodeID, a *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
 	c, err := t.client(to)
 	if err != nil {
 		return nil, err
@@ -75,6 +110,7 @@ func (t *Transport) RequestVote(ctx context.Context, to raft.NodeID, a *raft.Req
 		LastLogIndex: a.LastLogIndex,
 		LastLogTerm:  a.LastLogTerm,
 		PreVote:      a.PreVote,
+		Group:        group,
 	})
 	if err != nil {
 		return nil, err
@@ -82,12 +118,13 @@ func (t *Transport) RequestVote(ctx context.Context, to raft.NodeID, a *raft.Req
 	return &raft.RequestVoteReply{Term: r.Term, VoteGranted: r.VoteGranted}, nil
 }
 
-func (t *Transport) AppendEntries(ctx context.Context, to raft.NodeID, a *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+func (t *Transport) appendEntries(ctx context.Context, group uint32, to raft.NodeID, a *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	c, err := t.client(to)
 	if err != nil {
 		return nil, err
 	}
 	req := &raftpb.AppendEntriesRequest{
+		Group:        group,
 		Term:         a.Term,
 		LeaderId:     uint64(a.LeaderID),
 		PrevLogIndex: a.PrevLogIndex,
@@ -110,12 +147,13 @@ func (t *Transport) AppendEntries(ctx context.Context, to raft.NodeID, a *raft.A
 	}, nil
 }
 
-func (t *Transport) InstallSnapshot(ctx context.Context, to raft.NodeID, a *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+func (t *Transport) installSnapshot(ctx context.Context, group uint32, to raft.NodeID, a *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
 	c, err := t.client(to)
 	if err != nil {
 		return nil, err
 	}
 	r, err := c.InstallSnapshot(ctx, &raftpb.InstallSnapshotRequest{
+		Group:             group,
 		Term:              a.Term,
 		LeaderId:          uint64(a.LeaderID),
 		LastIncludedIndex: a.LastIncludedIndex,
@@ -130,19 +168,44 @@ func (t *Transport) InstallSnapshot(ctx context.Context, to raft.NodeID, a *raft
 	return &raft.InstallSnapshotReply{Term: r.Term, NextOffset: r.NextOffset}, nil
 }
 
-// server adapts a raft.Handler to the generated gRPC service.
-type server struct {
+// Router is the server side: it dispatches incoming Raft RPCs to the handler
+// registered for the RPC's group.
+type Router struct {
 	raftpb.UnimplementedRaftServer
-	h raft.Handler
+	mu       sync.RWMutex
+	handlers map[uint32]raft.Handler
 }
 
-// Register exposes h as the Raft service on s.
-func Register(s grpc.ServiceRegistrar, h raft.Handler) {
-	raftpb.RegisterRaftServer(s, &server{h: h})
+// Register creates a Router and exposes it as the Raft service on s.
+func Register(s grpc.ServiceRegistrar) *Router {
+	r := &Router{handlers: make(map[uint32]raft.Handler)}
+	raftpb.RegisterRaftServer(s, r)
+	return r
 }
 
-func (s *server) RequestVote(_ context.Context, r *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
-	reply, err := s.h.HandleRequestVote(&raft.RequestVoteArgs{
+// Handle routes RPCs for group to h.
+func (r *Router) Handle(group uint32, h raft.Handler) {
+	r.mu.Lock()
+	r.handlers[group] = h
+	r.mu.Unlock()
+}
+
+func (r *Router) handler(group uint32) (raft.Handler, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	h, ok := r.handlers[group]
+	if !ok {
+		return nil, fmt.Errorf("grpctransport: no raft group %d on this node", group)
+	}
+	return h, nil
+}
+
+func (s *Router) RequestVote(_ context.Context, r *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
+	h, err := s.handler(r.Group)
+	if err != nil {
+		return nil, err
+	}
+	reply, err := h.HandleRequestVote(&raft.RequestVoteArgs{
 		Term:         r.Term,
 		CandidateID:  raft.NodeID(r.CandidateId),
 		LastLogIndex: r.LastLogIndex,
@@ -155,7 +218,11 @@ func (s *server) RequestVote(_ context.Context, r *raftpb.RequestVoteRequest) (*
 	return &raftpb.RequestVoteResponse{Term: reply.Term, VoteGranted: reply.VoteGranted}, nil
 }
 
-func (s *server) AppendEntries(_ context.Context, r *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+func (s *Router) AppendEntries(_ context.Context, r *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+	h, err := s.handler(r.Group)
+	if err != nil {
+		return nil, err
+	}
 	args := &raft.AppendEntriesArgs{
 		Term:         r.Term,
 		LeaderID:     raft.NodeID(r.LeaderId),
@@ -167,7 +234,7 @@ func (s *server) AppendEntries(_ context.Context, r *raftpb.AppendEntriesRequest
 	for i, e := range r.Entries {
 		args.Entries[i] = raft.Entry{Term: e.Term, Index: e.Index, Type: raft.EntryType(e.Type), Data: e.Data}
 	}
-	reply, err := s.h.HandleAppendEntries(args)
+	reply, err := h.HandleAppendEntries(args)
 	if err != nil {
 		return nil, err
 	}
@@ -179,8 +246,12 @@ func (s *server) AppendEntries(_ context.Context, r *raftpb.AppendEntriesRequest
 	}, nil
 }
 
-func (s *server) InstallSnapshot(_ context.Context, r *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
-	reply, err := s.h.HandleInstallSnapshot(&raft.InstallSnapshotArgs{
+func (s *Router) InstallSnapshot(_ context.Context, r *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	h, err := s.handler(r.Group)
+	if err != nil {
+		return nil, err
+	}
+	reply, err := h.HandleInstallSnapshot(&raft.InstallSnapshotArgs{
 		Term:              r.Term,
 		LeaderID:          raft.NodeID(r.LeaderId),
 		LastIncludedIndex: r.LastIncludedIndex,

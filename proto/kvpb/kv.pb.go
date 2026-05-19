@@ -130,6 +130,7 @@ type Command struct {
 	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
 	Expected      []byte                 `protobuf:"bytes,4,opt,name=expected,proto3" json:"expected,omitempty"`
 	ExpectAbsent  bool                   `protobuf:"varint,5,opt,name=expect_absent,json=expectAbsent,proto3" json:"expect_absent,omitempty"`
+	DeleteOnMatch bool                   `protobuf:"varint,8,opt,name=delete_on_match,json=deleteOnMatch,proto3" json:"delete_on_match,omitempty"`
 	ClientId      uint64                 `protobuf:"varint,6,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
 	Seq           uint64                 `protobuf:"varint,7,opt,name=seq,proto3" json:"seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -197,6 +198,13 @@ func (x *Command) GetExpected() []byte {
 func (x *Command) GetExpectAbsent() bool {
 	if x != nil {
 		return x.ExpectAbsent
+	}
+	return false
+}
+
+func (x *Command) GetDeleteOnMatch() bool {
+	if x != nil {
+		return x.DeleteOnMatch
 	}
 	return false
 }
@@ -599,6 +607,7 @@ type CASRequest struct {
 	Value         []byte                 `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
 	ClientId      uint64                 `protobuf:"varint,5,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
 	Seq           uint64                 `protobuf:"varint,6,opt,name=seq,proto3" json:"seq,omitempty"`
+	DeleteOnMatch bool                   `protobuf:"varint,7,opt,name=delete_on_match,json=deleteOnMatch,proto3" json:"delete_on_match,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -673,6 +682,13 @@ func (x *CASRequest) GetSeq() uint64 {
 		return x.Seq
 	}
 	return 0
+}
+
+func (x *CASRequest) GetDeleteOnMatch() bool {
+	if x != nil {
+		return x.DeleteOnMatch
+	}
+	return false
 }
 
 type CASResponse struct {
@@ -759,6 +775,194 @@ func (x *CASResponse) GetCurrent() []byte {
 	return nil
 }
 
+type ScanRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Shard         uint32                 `protobuf:"varint,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Prefix        string                 `protobuf:"bytes,2,opt,name=prefix,proto3" json:"prefix,omitempty"`
+	After         string                 `protobuf:"bytes,3,opt,name=after,proto3" json:"after,omitempty"` // exclusive lower bound
+	Limit         uint32                 `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ScanRequest) Reset() {
+	*x = ScanRequest{}
+	mi := &file_proto_kvpb_kv_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ScanRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ScanRequest) ProtoMessage() {}
+
+func (x *ScanRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kvpb_kv_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ScanRequest.ProtoReflect.Descriptor instead.
+func (*ScanRequest) Descriptor() ([]byte, []int) {
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ScanRequest) GetShard() uint32 {
+	if x != nil {
+		return x.Shard
+	}
+	return 0
+}
+
+func (x *ScanRequest) GetPrefix() string {
+	if x != nil {
+		return x.Prefix
+	}
+	return ""
+}
+
+func (x *ScanRequest) GetAfter() string {
+	if x != nil {
+		return x.After
+	}
+	return ""
+}
+
+func (x *ScanRequest) GetLimit() uint32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type Pair struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Pair) Reset() {
+	*x = Pair{}
+	mi := &file_proto_kvpb_kv_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Pair) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Pair) ProtoMessage() {}
+
+func (x *Pair) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kvpb_kv_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Pair.ProtoReflect.Descriptor instead.
+func (*Pair) Descriptor() ([]byte, []int) {
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *Pair) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *Pair) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+type ScanResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        Status                 `protobuf:"varint,1,opt,name=status,proto3,enum=raftkv.kv.Status" json:"status,omitempty"`
+	LeaderHint    uint64                 `protobuf:"varint,2,opt,name=leader_hint,json=leaderHint,proto3" json:"leader_hint,omitempty"`
+	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	Pairs         []*Pair                `protobuf:"bytes,4,rep,name=pairs,proto3" json:"pairs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ScanResponse) Reset() {
+	*x = ScanResponse{}
+	mi := &file_proto_kvpb_kv_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ScanResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ScanResponse) ProtoMessage() {}
+
+func (x *ScanResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kvpb_kv_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ScanResponse.ProtoReflect.Descriptor instead.
+func (*ScanResponse) Descriptor() ([]byte, []int) {
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *ScanResponse) GetStatus() Status {
+	if x != nil {
+		return x.Status
+	}
+	return Status_OK
+}
+
+func (x *ScanResponse) GetLeaderHint() uint64 {
+	if x != nil {
+		return x.LeaderHint
+	}
+	return 0
+}
+
+func (x *ScanResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *ScanResponse) GetPairs() []*Pair {
+	if x != nil {
+		return x.Pairs
+	}
+	return nil
+}
+
 // StoreSnapshot is the serialized state machine used for Raft snapshots.
 type StoreSnapshot struct {
 	state         protoimpl.MessageState   `protogen:"open.v1"`
@@ -770,7 +974,7 @@ type StoreSnapshot struct {
 
 func (x *StoreSnapshot) Reset() {
 	*x = StoreSnapshot{}
-	mi := &file_proto_kvpb_kv_proto_msgTypes[9]
+	mi := &file_proto_kvpb_kv_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -782,7 +986,7 @@ func (x *StoreSnapshot) String() string {
 func (*StoreSnapshot) ProtoMessage() {}
 
 func (x *StoreSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_kvpb_kv_proto_msgTypes[9]
+	mi := &file_proto_kvpb_kv_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -795,7 +999,7 @@ func (x *StoreSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoreSnapshot.ProtoReflect.Descriptor instead.
 func (*StoreSnapshot) Descriptor() ([]byte, []int) {
-	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{9}
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *StoreSnapshot) GetData() map[string][]byte {
@@ -824,7 +1028,7 @@ type SessionState struct {
 
 func (x *SessionState) Reset() {
 	*x = SessionState{}
-	mi := &file_proto_kvpb_kv_proto_msgTypes[10]
+	mi := &file_proto_kvpb_kv_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -836,7 +1040,7 @@ func (x *SessionState) String() string {
 func (*SessionState) ProtoMessage() {}
 
 func (x *SessionState) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_kvpb_kv_proto_msgTypes[10]
+	mi := &file_proto_kvpb_kv_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -849,7 +1053,7 @@ func (x *SessionState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionState.ProtoReflect.Descriptor instead.
 func (*SessionState) Descriptor() ([]byte, []int) {
-	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{10}
+	return file_proto_kvpb_kv_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SessionState) GetSeq() uint64 {
@@ -884,13 +1088,14 @@ var File_proto_kvpb_kv_proto protoreflect.FileDescriptor
 
 const file_proto_kvpb_kv_proto_rawDesc = "" +
 	"\n" +
-	"\x13proto/kvpb/kv.proto\x12\traftkv.kv\"\xc0\x01\n" +
+	"\x13proto/kvpb/kv.proto\x12\traftkv.kv\"\xe8\x01\n" +
 	"\aCommand\x12\x1d\n" +
 	"\x02op\x18\x01 \x01(\x0e2\r.raftkv.kv.OpR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x1a\n" +
 	"\bexpected\x18\x04 \x01(\fR\bexpected\x12#\n" +
-	"\rexpect_absent\x18\x05 \x01(\bR\fexpectAbsent\x12\x1b\n" +
+	"\rexpect_absent\x18\x05 \x01(\bR\fexpectAbsent\x12&\n" +
+	"\x0fdelete_on_match\x18\b \x01(\bR\rdeleteOnMatch\x12\x1b\n" +
 	"\tclient_id\x18\x06 \x01(\x04R\bclientId\x12\x10\n" +
 	"\x03seq\x18\a \x01(\x04R\x03seq\"c\n" +
 	"\n" +
@@ -923,7 +1128,7 @@ const file_proto_kvpb_kv_proto_rawDesc = "" +
 	"\vleader_hint\x18\x02 \x01(\x04R\n" +
 	"leaderHint\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\x12\x18\n" +
-	"\aexisted\x18\x04 \x01(\bR\aexisted\"\xa4\x01\n" +
+	"\aexisted\x18\x04 \x01(\bR\aexisted\"\xcc\x01\n" +
 	"\n" +
 	"CASRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x1a\n" +
@@ -931,7 +1136,8 @@ const file_proto_kvpb_kv_proto_rawDesc = "" +
 	"\rexpect_absent\x18\x03 \x01(\bR\fexpectAbsent\x12\x14\n" +
 	"\x05value\x18\x04 \x01(\fR\x05value\x12\x1b\n" +
 	"\tclient_id\x18\x05 \x01(\x04R\bclientId\x12\x10\n" +
-	"\x03seq\x18\x06 \x01(\x04R\x03seq\"\xb9\x01\n" +
+	"\x03seq\x18\x06 \x01(\x04R\x03seq\x12&\n" +
+	"\x0fdelete_on_match\x18\a \x01(\bR\rdeleteOnMatch\"\xb9\x01\n" +
 	"\vCASResponse\x12)\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x11.raftkv.kv.StatusR\x06status\x12\x1f\n" +
 	"\vleader_hint\x18\x02 \x01(\x04R\n" +
@@ -939,7 +1145,21 @@ const file_proto_kvpb_kv_proto_rawDesc = "" +
 	"\x05error\x18\x03 \x01(\tR\x05error\x12\x18\n" +
 	"\aswapped\x18\x04 \x01(\bR\aswapped\x12\x14\n" +
 	"\x05found\x18\x05 \x01(\bR\x05found\x12\x18\n" +
-	"\acurrent\x18\x06 \x01(\fR\acurrent\"\x9a\x02\n" +
+	"\acurrent\x18\x06 \x01(\fR\acurrent\"g\n" +
+	"\vScanRequest\x12\x14\n" +
+	"\x05shard\x18\x01 \x01(\rR\x05shard\x12\x16\n" +
+	"\x06prefix\x18\x02 \x01(\tR\x06prefix\x12\x14\n" +
+	"\x05after\x18\x03 \x01(\tR\x05after\x12\x14\n" +
+	"\x05limit\x18\x04 \x01(\rR\x05limit\".\n" +
+	"\x04Pair\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"\x97\x01\n" +
+	"\fScanResponse\x12)\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x11.raftkv.kv.StatusR\x06status\x12\x1f\n" +
+	"\vleader_hint\x18\x02 \x01(\x04R\n" +
+	"leaderHint\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12%\n" +
+	"\x05pairs\x18\x04 \x03(\v2\x0f.raftkv.kv.PairR\x05pairs\"\x9a\x02\n" +
 	"\rStoreSnapshot\x126\n" +
 	"\x04data\x18\x01 \x03(\v2\".raftkv.kv.StoreSnapshot.DataEntryR\x04data\x12B\n" +
 	"\bsessions\x18\x02 \x03(\v2&.raftkv.kv.StoreSnapshot.SessionsEntryR\bsessions\x1a7\n" +
@@ -964,12 +1184,13 @@ const file_proto_kvpb_kv_proto_rawDesc = "" +
 	"\x03PUT\x10\x00\x12\n" +
 	"\n" +
 	"\x06DELETE\x10\x01\x12\a\n" +
-	"\x03CAS\x10\x022\xe5\x01\n" +
+	"\x03CAS\x10\x022\x9e\x02\n" +
 	"\x02KV\x124\n" +
 	"\x03Put\x12\x15.raftkv.kv.PutRequest\x1a\x16.raftkv.kv.PutResponse\x124\n" +
 	"\x03Get\x12\x15.raftkv.kv.GetRequest\x1a\x16.raftkv.kv.GetResponse\x12=\n" +
 	"\x06Delete\x12\x18.raftkv.kv.DeleteRequest\x1a\x19.raftkv.kv.DeleteResponse\x124\n" +
-	"\x03CAS\x12\x15.raftkv.kv.CASRequest\x1a\x16.raftkv.kv.CASResponseB'Z%github.com/Jenil133/raftkv/proto/kvpbb\x06proto3"
+	"\x03CAS\x12\x15.raftkv.kv.CASRequest\x1a\x16.raftkv.kv.CASResponse\x127\n" +
+	"\x04Scan\x12\x16.raftkv.kv.ScanRequest\x1a\x17.raftkv.kv.ScanResponseB'Z%github.com/Jenil133/raftkv/proto/kvpbb\x06proto3"
 
 var (
 	file_proto_kvpb_kv_proto_rawDescOnce sync.Once
@@ -984,7 +1205,7 @@ func file_proto_kvpb_kv_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_kvpb_kv_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_kvpb_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_proto_kvpb_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_proto_kvpb_kv_proto_goTypes = []any{
 	(Status)(0),            // 0: raftkv.kv.Status
 	(Op)(0),                // 1: raftkv.kv.Op
@@ -997,10 +1218,13 @@ var file_proto_kvpb_kv_proto_goTypes = []any{
 	(*DeleteResponse)(nil), // 8: raftkv.kv.DeleteResponse
 	(*CASRequest)(nil),     // 9: raftkv.kv.CASRequest
 	(*CASResponse)(nil),    // 10: raftkv.kv.CASResponse
-	(*StoreSnapshot)(nil),  // 11: raftkv.kv.StoreSnapshot
-	(*SessionState)(nil),   // 12: raftkv.kv.SessionState
-	nil,                    // 13: raftkv.kv.StoreSnapshot.DataEntry
-	nil,                    // 14: raftkv.kv.StoreSnapshot.SessionsEntry
+	(*ScanRequest)(nil),    // 11: raftkv.kv.ScanRequest
+	(*Pair)(nil),           // 12: raftkv.kv.Pair
+	(*ScanResponse)(nil),   // 13: raftkv.kv.ScanResponse
+	(*StoreSnapshot)(nil),  // 14: raftkv.kv.StoreSnapshot
+	(*SessionState)(nil),   // 15: raftkv.kv.SessionState
+	nil,                    // 16: raftkv.kv.StoreSnapshot.DataEntry
+	nil,                    // 17: raftkv.kv.StoreSnapshot.SessionsEntry
 }
 var file_proto_kvpb_kv_proto_depIdxs = []int32{
 	1,  // 0: raftkv.kv.Command.op:type_name -> raftkv.kv.Op
@@ -1008,22 +1232,26 @@ var file_proto_kvpb_kv_proto_depIdxs = []int32{
 	0,  // 2: raftkv.kv.GetResponse.status:type_name -> raftkv.kv.Status
 	0,  // 3: raftkv.kv.DeleteResponse.status:type_name -> raftkv.kv.Status
 	0,  // 4: raftkv.kv.CASResponse.status:type_name -> raftkv.kv.Status
-	13, // 5: raftkv.kv.StoreSnapshot.data:type_name -> raftkv.kv.StoreSnapshot.DataEntry
-	14, // 6: raftkv.kv.StoreSnapshot.sessions:type_name -> raftkv.kv.StoreSnapshot.SessionsEntry
-	12, // 7: raftkv.kv.StoreSnapshot.SessionsEntry.value:type_name -> raftkv.kv.SessionState
-	3,  // 8: raftkv.kv.KV.Put:input_type -> raftkv.kv.PutRequest
-	5,  // 9: raftkv.kv.KV.Get:input_type -> raftkv.kv.GetRequest
-	7,  // 10: raftkv.kv.KV.Delete:input_type -> raftkv.kv.DeleteRequest
-	9,  // 11: raftkv.kv.KV.CAS:input_type -> raftkv.kv.CASRequest
-	4,  // 12: raftkv.kv.KV.Put:output_type -> raftkv.kv.PutResponse
-	6,  // 13: raftkv.kv.KV.Get:output_type -> raftkv.kv.GetResponse
-	8,  // 14: raftkv.kv.KV.Delete:output_type -> raftkv.kv.DeleteResponse
-	10, // 15: raftkv.kv.KV.CAS:output_type -> raftkv.kv.CASResponse
-	12, // [12:16] is the sub-list for method output_type
-	8,  // [8:12] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	0,  // 5: raftkv.kv.ScanResponse.status:type_name -> raftkv.kv.Status
+	12, // 6: raftkv.kv.ScanResponse.pairs:type_name -> raftkv.kv.Pair
+	16, // 7: raftkv.kv.StoreSnapshot.data:type_name -> raftkv.kv.StoreSnapshot.DataEntry
+	17, // 8: raftkv.kv.StoreSnapshot.sessions:type_name -> raftkv.kv.StoreSnapshot.SessionsEntry
+	15, // 9: raftkv.kv.StoreSnapshot.SessionsEntry.value:type_name -> raftkv.kv.SessionState
+	3,  // 10: raftkv.kv.KV.Put:input_type -> raftkv.kv.PutRequest
+	5,  // 11: raftkv.kv.KV.Get:input_type -> raftkv.kv.GetRequest
+	7,  // 12: raftkv.kv.KV.Delete:input_type -> raftkv.kv.DeleteRequest
+	9,  // 13: raftkv.kv.KV.CAS:input_type -> raftkv.kv.CASRequest
+	11, // 14: raftkv.kv.KV.Scan:input_type -> raftkv.kv.ScanRequest
+	4,  // 15: raftkv.kv.KV.Put:output_type -> raftkv.kv.PutResponse
+	6,  // 16: raftkv.kv.KV.Get:output_type -> raftkv.kv.GetResponse
+	8,  // 17: raftkv.kv.KV.Delete:output_type -> raftkv.kv.DeleteResponse
+	10, // 18: raftkv.kv.KV.CAS:output_type -> raftkv.kv.CASResponse
+	13, // 19: raftkv.kv.KV.Scan:output_type -> raftkv.kv.ScanResponse
+	15, // [15:20] is the sub-list for method output_type
+	10, // [10:15] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_proto_kvpb_kv_proto_init() }
@@ -1037,7 +1265,7 @@ func file_proto_kvpb_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_kvpb_kv_proto_rawDesc), len(file_proto_kvpb_kv_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   13,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

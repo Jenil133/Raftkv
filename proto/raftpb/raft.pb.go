@@ -96,6 +96,7 @@ type RequestVoteRequest struct {
 	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
 	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
 	PreVote       bool                   `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
+	Group         uint32                 `protobuf:"varint,10,opt,name=group,proto3" json:"group,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -165,6 +166,13 @@ func (x *RequestVoteRequest) GetPreVote() bool {
 	return false
 }
 
+func (x *RequestVoteRequest) GetGroup() uint32 {
+	if x != nil {
+		return x.Group
+	}
+	return 0
+}
+
 type RequestVoteResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
@@ -225,6 +233,7 @@ type AppendEntriesRequest struct {
 	PrevLogTerm   uint64                 `protobuf:"varint,4,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
 	Entries       []*Entry               `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"`
 	LeaderCommit  uint64                 `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
+	Group         uint32                 `protobuf:"varint,10,opt,name=group,proto3" json:"group,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -297,6 +306,13 @@ func (x *AppendEntriesRequest) GetEntries() []*Entry {
 func (x *AppendEntriesRequest) GetLeaderCommit() uint64 {
 	if x != nil {
 		return x.LeaderCommit
+	}
+	return 0
+}
+
+func (x *AppendEntriesRequest) GetGroup() uint32 {
+	if x != nil {
+		return x.Group
 	}
 	return 0
 }
@@ -378,6 +394,7 @@ type InstallSnapshotRequest struct {
 	Offset            uint64                 `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
 	Data              []byte                 `protobuf:"bytes,6,opt,name=data,proto3" json:"data,omitempty"`
 	Done              bool                   `protobuf:"varint,7,opt,name=done,proto3" json:"done,omitempty"`
+	Group             uint32                 `protobuf:"varint,10,opt,name=group,proto3" json:"group,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -461,6 +478,13 @@ func (x *InstallSnapshotRequest) GetDone() bool {
 	return false
 }
 
+func (x *InstallSnapshotRequest) GetGroup() uint32 {
+	if x != nil {
+		return x.Group
+	}
+	return 0
+}
+
 type InstallSnapshotResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
@@ -522,28 +546,32 @@ const file_proto_raftpb_raft_proto_rawDesc = "" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04type\x18\x03 \x01(\rR\x04type\x12\x12\n" +
-	"\x04data\x18\x04 \x01(\fR\x04data\"\xb0\x01\n" +
+	"\x04data\x18\x04 \x01(\fR\x04data\"\xc6\x01\n" +
 	"\x12RequestVoteRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\x04R\vcandidateId\x12$\n" +
 	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
 	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x19\n" +
-	"\bpre_vote\x18\x05 \x01(\bR\apreVote\"L\n" +
+	"\bpre_vote\x18\x05 \x01(\bR\apreVote\x12\x14\n" +
+	"\x05group\x18\n" +
+	" \x01(\rR\x05group\"L\n" +
 	"\x13RequestVoteResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
-	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xe4\x01\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xfa\x01\n" +
 	"\x14AppendEntriesRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\x04R\bleaderId\x12$\n" +
 	"\x0eprev_log_index\x18\x03 \x01(\x04R\fprevLogIndex\x12\"\n" +
 	"\rprev_log_term\x18\x04 \x01(\x04R\vprevLogTerm\x12,\n" +
 	"\aentries\x18\x05 \x03(\v2\x12.raftkv.raft.EntryR\aentries\x12#\n" +
-	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"\x91\x01\n" +
+	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\x12\x14\n" +
+	"\x05group\x18\n" +
+	" \x01(\rR\x05group\"\x91\x01\n" +
 	"\x15AppendEntriesResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12%\n" +
 	"\x0econflict_index\x18\x03 \x01(\x04R\rconflictIndex\x12#\n" +
-	"\rconflict_term\x18\x04 \x01(\x04R\fconflictTerm\"\xe7\x01\n" +
+	"\rconflict_term\x18\x04 \x01(\x04R\fconflictTerm\"\xfd\x01\n" +
 	"\x16InstallSnapshotRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\x04R\bleaderId\x12.\n" +
@@ -551,7 +579,9 @@ const file_proto_raftpb_raft_proto_rawDesc = "" +
 	"\x12last_included_term\x18\x04 \x01(\x04R\x10lastIncludedTerm\x12\x16\n" +
 	"\x06offset\x18\x05 \x01(\x04R\x06offset\x12\x12\n" +
 	"\x04data\x18\x06 \x01(\fR\x04data\x12\x12\n" +
-	"\x04done\x18\a \x01(\bR\x04done\"N\n" +
+	"\x04done\x18\a \x01(\bR\x04done\x12\x14\n" +
+	"\x05group\x18\n" +
+	" \x01(\rR\x05group\"N\n" +
 	"\x17InstallSnapshotResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1f\n" +
 	"\vnext_offset\x18\x02 \x01(\x04R\n" +

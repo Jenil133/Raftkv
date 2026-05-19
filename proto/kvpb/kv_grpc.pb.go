@@ -23,6 +23,7 @@ const (
 	KV_Get_FullMethodName    = "/raftkv.kv.KV/Get"
 	KV_Delete_FullMethodName = "/raftkv.kv.KV/Delete"
 	KV_CAS_FullMethodName    = "/raftkv.kv.KV/CAS"
+	KV_Scan_FullMethodName   = "/raftkv.kv.KV/Scan"
 )
 
 // KVClient is the client API for KV service.
@@ -33,6 +34,7 @@ type KVClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	CAS(ctx context.Context, in *CASRequest, opts ...grpc.CallOption) (*CASResponse, error)
+	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error)
 }
 
 type kVClient struct {
@@ -83,6 +85,16 @@ func (c *kVClient) CAS(ctx context.Context, in *CASRequest, opts ...grpc.CallOpt
 	return out, nil
 }
 
+func (c *kVClient) Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ScanResponse)
+	err := c.cc.Invoke(ctx, KV_Scan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVServer is the server API for KV service.
 // All implementations must embed UnimplementedKVServer
 // for forward compatibility.
@@ -91,6 +103,7 @@ type KVServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	CAS(context.Context, *CASRequest) (*CASResponse, error)
+	Scan(context.Context, *ScanRequest) (*ScanResponse, error)
 	mustEmbedUnimplementedKVServer()
 }
 
@@ -112,6 +125,9 @@ func (UnimplementedKVServer) Delete(context.Context, *DeleteRequest) (*DeleteRes
 }
 func (UnimplementedKVServer) CAS(context.Context, *CASRequest) (*CASResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CAS not implemented")
+}
+func (UnimplementedKVServer) Scan(context.Context, *ScanRequest) (*ScanResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Scan not implemented")
 }
 func (UnimplementedKVServer) mustEmbedUnimplementedKVServer() {}
 func (UnimplementedKVServer) testEmbeddedByValue()            {}
@@ -206,6 +222,24 @@ func _KV_CAS_Handler(srv interface{}, ctx context.Context, dec func(interface{})
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KV_Scan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ScanRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServer).Scan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KV_Scan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServer).Scan(ctx, req.(*ScanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KV_ServiceDesc is the grpc.ServiceDesc for KV service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -228,6 +262,10 @@ var KV_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CAS",
 			Handler:    _KV_CAS_Handler,
+		},
+		{
+			MethodName: "Scan",
+			Handler:    _KV_Scan_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
