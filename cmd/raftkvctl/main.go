@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/Jenil133/raftkv/doc"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
 	"github.com/Jenil133/raftkv/shard"
@@ -27,6 +28,13 @@ commands:
   cas <key> <expected> <value>     set value if current value equals expected
   cas-absent <key> <value>         set value only if key does not exist
   scan <prefix> [limit]            list keys under a prefix across all shards
+
+document API (JSON objects addressed by collection and id):
+  doc-put <coll> <id> <json>       create or replace a document
+  doc-get <coll> <id>
+  doc-patch <coll> <id> <json>     RFC 7386 merge patch ({"field":null} removes a field)
+  doc-del <coll> <id>
+  doc-scan <coll> [limit]
 `
 
 func main() {
@@ -55,6 +63,7 @@ func main() {
 		eps[id] = kvpb.NewKVClient(conn)
 	}
 	cl := shard.NewClient(eps, *shards)
+	docs := doc.NewStore(cl)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
@@ -103,6 +112,35 @@ func main() {
 		for _, p := range pairs {
 			fmt.Printf("%s = %s\n", p.Key, p.Value)
 		}
+	case "doc-put":
+		need(3)
+		d, err := docs.Put(ctx, args[1], args[2], []byte(args[3]), nil)
+		check(err)
+		printDoc(d)
+	case "doc-get":
+		need(2)
+		d, err := docs.Get(ctx, args[1], args[2])
+		check(err)
+		printDoc(d)
+	case "doc-patch":
+		need(3)
+		d, err := docs.Patch(ctx, args[1], args[2], []byte(args[3]), nil)
+		check(err)
+		printDoc(d)
+	case "doc-del":
+		need(2)
+		check(docs.Delete(ctx, args[1], args[2], nil))
+		fmt.Println("OK")
+	case "doc-scan":
+		if len(args) < 2 || len(args) > 3 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		list, err := docs.Scan(ctx, args[1], "", limitArg(args, 2))
+		check(err)
+		for _, d := range list {
+			printDoc(d)
+		}
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -118,6 +156,10 @@ func limitArg(args []string, i int) int {
 		fatal(fmt.Errorf("bad limit %q", args[i]))
 	}
 	return n
+}
+
+func printDoc(d doc.Document) {
+	fmt.Printf("%s/%s v%d %s\n", d.Collection, d.ID, d.Version, d.Data)
 }
 
 func check(err error) {

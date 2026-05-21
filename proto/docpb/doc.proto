@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package raftkv.doc;
+
+option go_package = "github.com/Jenil133/raftkv/proto/docpb";
+
+enum Code {
+  OK = 0;
+  NOT_FOUND = 1;
+  VERSION_CONFLICT = 2;
+  INVALID = 3;
+  UNAVAILABLE = 4;
+}
+
+message Document {
+  string collection = 1;
+  string id = 2;
+  uint64 version = 3;
+  bytes json = 4;
+}
+
+message PutRequest {
+  string collection = 1;
+  string id = 2;
+  bytes json = 3;
+  bool has_if_version = 4;
+  uint64 if_version = 5; // 0 with has_if_version means "create only"
+}
+
+message GetRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message DeleteRequest {
+  string collection = 1;
+  string id = 2;
+  bool has_if_version = 3;
+  uint64 if_version = 4;
+}
+
+// PatchRequest carries an RFC 7386 JSON merge patch.
+message PatchRequest {
+  string collection = 1;
+  string id = 2;
+  bytes patch = 3;
+  bool has_if_version = 4;
+  uint64 if_version = 5;
+}
+
+message ScanRequest {
+  string collection = 1;
+  string after_id = 2; // exclusive
+  uint32 limit = 3;
+}
+
+message Response {
+  Code code = 1;
+  string error = 2;
+  Document doc = 3;
+}
+
+message ScanResponse {
+  Code code = 1;
+  string error = 2;
+  repeated Document docs = 3;
+}
+
+service Docs {
+  rpc Put(PutRequest) returns (Response);
+  rpc Get(GetRequest) returns (Response);
+  rpc Delete(DeleteRequest) returns (Response);
+  rpc Patch(PatchRequest) returns (Response);
+  rpc Scan(ScanRequest) returns (ScanResponse);
+}

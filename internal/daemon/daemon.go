@@ -1,6 +1,6 @@
 // Package daemon assembles one production node: per-shard WAL storage, gRPC
 // transport, Raft groups, KV servers, and the gRPC listener that serves the
-// Raft and KV APIs.
+// Raft, KV and document APIs.
 package daemon
 
 import (
@@ -11,8 +11,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/Jenil133/raftkv/doc"
 	"github.com/Jenil133/raftkv/kv"
+	"github.com/Jenil133/raftkv/proto/docpb"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
 	"github.com/Jenil133/raftkv/shard"
@@ -48,6 +51,7 @@ type Daemon struct {
 	transport *grpctransport.Transport
 	wals      []*storage.WAL
 	lis       net.Listener
+	docConns  []*grpc.ClientConn
 	serveDone chan struct{}
 }
 
@@ -125,6 +129,19 @@ func Start(o Options) (*Daemon, error) {
 	d.Host = shard.NewHost(groups)
 	kvpb.RegisterKVServer(d.grpc, d.Host)
 
+	// The document API coordinates across shards, whose leaders may be on
+	// other nodes, so it talks to the cluster through an ordinary client.
+	eps := make(map[raft.NodeID]kvpb.KVClient, len(o.Peers))
+	for id, addr := range o.Peers {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return fail(err)
+		}
+		d.docConns = append(d.docConns, conn)
+		eps[id] = kvpb.NewKVClient(conn)
+	}
+	docpb.RegisterDocsServer(d.grpc, doc.NewServer(doc.NewStore(shard.NewClient(eps, o.Shards))))
+
 	for _, g := range groups {
 		g.Raft.Start()
 	}
@@ -154,6 +171,9 @@ func (d *Daemon) Stop() {
 	}
 	for _, g := range d.Host.Groups {
 		g.KV.Wait()
+	}
+	for _, c := range d.docConns {
+		c.Close()
 	}
 	d.transport.Close()
 	for _, w := range d.wals {
