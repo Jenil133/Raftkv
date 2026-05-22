@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/Jenil133/raftkv/proto/docpb"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
 	"github.com/Jenil133/raftkv/shard"
@@ -113,6 +114,11 @@ func (g *gcluster) client() *shard.Client {
 	return cl
 }
 
+// docClient talks to the document service of one node.
+func (g *gcluster) docClient(id raft.NodeID) docpb.DocsClient {
+	return docpb.NewDocsClient(g.conns()[id])
+}
+
 func TestGRPCClusterEndToEnd(t *testing.T) {
 	g := newGRPCCluster(t, 3, 1, 0)
 	cl := g.client()
@@ -163,5 +169,81 @@ func TestGRPCClusterEndToEnd(t *testing.T) {
 			t.Fatalf("restarted node did not catch up: %v", d)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestGRPCShardsSnapshotsAndDocs(t *testing.T) {
+	g := newGRPCCluster(t, 3, 3, 15)
+	cl := g.client()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Plain KV across shards.
+	for i := 0; i < 90; i++ {
+		if err := cl.Put(ctx, fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	// Document service on a node, which coordinates across shards itself.
+	docs := g.docClient(1)
+	put, err := docs.Put(ctx, &docpb.PutRequest{Collection: "users", Id: "ann", Json: []byte(`{"name":"Ann","n":1}`)})
+	if err != nil || put.Code != docpb.Code_OK || put.Doc.Version != 1 {
+		t.Fatalf("doc put: %+v %v", put, err)
+	}
+	patch, err := docs.Patch(ctx, &docpb.PatchRequest{Collection: "users", Id: "ann", Patch: []byte(`{"n":null,"city":"Oslo"}`)})
+	if err != nil || patch.Code != docpb.Code_OK || patch.Doc.Version != 2 {
+		t.Fatalf("doc patch: %+v %v", patch, err)
+	}
+	// Read through a different node.
+	got, err := g.docClient(2).Get(ctx, &docpb.GetRequest{Collection: "users", Id: "ann"})
+	if err != nil || got.Code != docpb.Code_OK || string(got.Doc.Json) != `{"city":"Oslo","name":"Ann"}` {
+		t.Fatalf("doc get: %+v %v", got, err)
+	}
+	conflict, _ := docs.Put(ctx, &docpb.PutRequest{
+		Collection: "users", Id: "ann", Json: []byte(`{}`), HasIfVersion: true, IfVersion: 1,
+	})
+	if conflict.Code != docpb.Code_VERSION_CONFLICT {
+		t.Fatalf("expected version conflict, got %v", conflict.Code)
+	}
+	for i := 0; i < 10; i++ {
+		docs.Put(ctx, &docpb.PutRequest{Collection: "pets", Id: fmt.Sprintf("p%02d", i), Json: []byte(`{"legs":4}`)})
+	}
+	scan, err := docs.Scan(ctx, &docpb.ScanRequest{Collection: "pets", Limit: 4})
+	if err != nil || scan.Code != docpb.Code_OK || len(scan.Docs) != 4 || scan.Docs[0].Id != "p00" || scan.Docs[3].Id != "p03" {
+		t.Fatalf("doc scan: %+v %v", scan, err)
+	}
+	if r, _ := docs.Get(ctx, &docpb.GetRequest{Collection: "users", Id: "ghost"}); r.Code != docpb.Code_NOT_FOUND {
+		t.Fatalf("expected not found, got %v", r.Code)
+	}
+
+	// Snapshots must have kicked in on every shard of every node.
+	for id, d := range g.nodes {
+		for s := 0; s < 3; s++ {
+			if d.Shard(s).Raft.Stats().SnapshotsTaken == 0 {
+				t.Fatalf("node %d shard %d never snapshotted", id, s)
+			}
+		}
+	}
+
+	// Restart a node: it comes back from snapshot + WAL and serves everything.
+	g.stop(2)
+	g.restart(2)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		total := 0
+		for s := 0; s < 3; s++ {
+			total += len(g.nodes[2].Shard(s).KV.Store().Dump())
+		}
+		if total >= 90+1+10 { // 90 kv keys + users/ann + 10 pets
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restarted node holds %d keys", total)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if r, err := g.docClient(2).Get(ctx, &docpb.GetRequest{Collection: "users", Id: "ann"}); err != nil || r.Code != docpb.Code_OK {
+		t.Fatalf("doc get after restart: %+v %v", r, err)
 	}
 }
