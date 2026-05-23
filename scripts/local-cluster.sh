@@ -17,7 +17,7 @@ go build -o bin/raftkvctl ./cmd/raftkvctl
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT INT TERM
 for i in $(seq 1 "$N"); do
-  ./bin/raftkvd -id "$i" -peers "$PEERS" >"data-node$i.log" 2>&1 &
+  ./bin/raftkvd -id "$i" -peers "$PEERS" -shards "${SHARDS:-4}" >"data-node$i.log" 2>&1 &
   pids+=($!)
 done
 echo "cluster up: $PEERS"
