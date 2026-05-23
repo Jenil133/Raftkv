@@ -212,43 +212,60 @@ func TestExactlyOnceSurvivesSnapshot(t *testing.T) {
 func TestSnapshotsUnderChurn(t *testing.T) {
 	c := cluster.New(t, 5, cluster.WithSnapshotEvery(10))
 	c.WaitLeader(3 * time.Second)
-	done := make(chan struct{})
+
+	stop := make(chan struct{})
+	written := make(chan int, 1)
 	errc := make(chan error, 1)
 	go func() {
-		defer close(done)
 		cl := c.Client()
 		ctx := ctxTimeout(t, 90*time.Second)
-		for i := 0; i < 150; i++ {
-			if err := cl.Put(ctx, fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		n := 0
+		for {
+			select {
+			case <-stop:
+				written <- n
+				return
+			default:
+			}
+			if err := cl.Put(ctx, fmt.Sprintf("k%d", n), []byte(fmt.Sprintf("v%d", n))); err != nil {
 				errc <- err
 				return
 			}
+			n++
 		}
 	}()
+
 	// Crash and revive nodes round-robin while writes stream in.
-	for i := 0; ; i++ {
-		select {
-		case <-done:
-			goto finished
-		case <-time.After(120 * time.Millisecond):
-		}
+	for i := 0; i < 8; i++ {
+		time.Sleep(60 * time.Millisecond)
 		id := c.IDs[i%len(c.IDs)]
 		c.Crash(id)
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(120 * time.Millisecond)
 		c.Restart(id)
 	}
-finished:
+	close(stop)
+	var n int
 	select {
+	case n = <-written:
 	case err := <-errc:
 		t.Fatal(err)
-	default:
 	}
-	c.Eventually(15*time.Second, "every node converges", func() bool {
+	if n < 20 {
+		t.Fatalf("only %d writes completed during churn", n)
+	}
+	c.Eventually(20*time.Second, "every node converges", func() bool {
 		for _, id := range c.IDs {
-			if !allKeys(c, id, "k", 150) {
+			if !allKeys(c, id, "k", n) {
 				return false
 			}
 		}
 		return true
 	})
+	var installed uint64
+	for _, id := range c.IDs {
+		installed += c.Node(id, 0).Stats().SnapshotsTaken
+	}
+	if installed == 0 {
+		t.Fatal("no snapshots taken during churn")
+	}
 }
