@@ -36,6 +36,7 @@ func TestMemoryRoundTrip(t *testing.T) {
 	if err := m.Append(entries(2, 4, 2)); err != nil {
 		t.Fatal(err)
 	}
+	m.Sync()
 	st := mustLoad(t, m)
 	if st.HardState != (raft.HardState{Term: 3, VotedFor: 2}) || len(st.Entries) != 5 ||
 		st.Entries[3].Term != 2 || st.Entries[2].Term != 1 {
@@ -49,6 +50,7 @@ func TestMemoryRoundTrip(t *testing.T) {
 func TestMemorySnapshotCompacts(t *testing.T) {
 	m := NewMemory()
 	m.Append(entries(1, 1, 10))
+	m.Sync()
 	if err := m.SaveSnapshot(raft.Snapshot{Index: 6, Term: 1, Data: []byte("s")}); err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +61,7 @@ func TestMemorySnapshotCompacts(t *testing.T) {
 	if err := m.Append(entries(1, 11, 1)); err != nil {
 		t.Fatal(err)
 	}
+	m.Sync()
 	// Snapshot beyond the log empties it and moves the append point.
 	m.SaveSnapshot(raft.Snapshot{Index: 50, Term: 2})
 	if st := mustLoad(t, m); len(st.Entries) != 0 {
@@ -69,6 +72,36 @@ func TestMemorySnapshotCompacts(t *testing.T) {
 	}
 	if err := m.TruncateFrom(50); err == nil {
 		t.Fatal("truncating into snapshot accepted")
+	}
+}
+
+func TestMemoryLosesUnsyncedWritesOnCrash(t *testing.T) {
+	m := NewMemory()
+	m.SaveHardState(raft.HardState{Term: 1, VotedFor: 1})
+	m.Append(entries(1, 1, 3))
+	m.Sync()
+
+	// Unsynced: more entries, a new term, and a truncation of synced entries.
+	m.Append(entries(1, 4, 2))
+	m.SaveHardState(raft.HardState{Term: 2, VotedFor: 2})
+	st := mustLoad(t, m) // "crash and restart"
+	if st.HardState != (raft.HardState{Term: 1, VotedFor: 1}) || len(st.Entries) != 3 {
+		t.Fatalf("unsynced writes survived: %+v", st)
+	}
+
+	m.TruncateFrom(2)
+	m.Append(entries(2, 2, 2))
+	st = mustLoad(t, m) // crash before Sync: the truncation never happened
+	if len(st.Entries) != 3 || st.Entries[1].Term != 1 {
+		t.Fatalf("unsynced truncation took effect: %+v", st.Entries)
+	}
+
+	m.TruncateFrom(2)
+	m.Append(entries(2, 2, 2))
+	m.Sync()
+	st = mustLoad(t, m)
+	if len(st.Entries) != 3 || st.Entries[1].Term != 2 || st.Entries[2].Term != 2 {
+		t.Fatalf("synced truncate+append lost: %+v", st.Entries)
 	}
 }
 
