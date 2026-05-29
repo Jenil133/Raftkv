@@ -71,6 +71,11 @@ type Node struct {
 
 	commitIndex uint64
 	lastApplied uint64
+	// durableIndex is how far the leader's own log is known to be on disk. The
+	// leader appends without waiting for fsync and counts itself toward the
+	// commit quorum only up to here (Raft thesis §10.2.1).
+	durableIndex uint64
+	syncCh       chan struct{}
 
 	// Leader state, valid while role == Leader.
 	nextIndex  map[NodeID]uint64
@@ -146,6 +151,7 @@ func NewNode(cfg Config) (*Node, error) {
 		votedFor: hs.VotedFor,
 		log:      l,
 		applyCh:  make(chan Apply, cfg.ApplyBuffer),
+		syncCh:   make(chan struct{}, 1),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -168,6 +174,7 @@ func (n *Node) Start() {
 	n.resetElectionDeadline()
 	n.goLocked(n.tickLoop)
 	n.goLocked(n.applyLoop)
+	n.goLocked(n.syncLoop)
 }
 
 // Stop halts the node and closes the Applied channel once drained.
@@ -224,17 +231,45 @@ func (n *Node) Propose(data []byte) (index, term uint64, ok bool) {
 	}
 	e := Entry{Term: n.term, Index: n.log.lastIndex() + 1, Type: EntryNormal, Data: data}
 	n.appendLocked(e)
-	n.syncLocked()
-	n.afterLocalAppendLocked()
+	// Replicate right away; the local fsync happens in parallel (syncLoop)
+	// and many proposals share one fsync.
+	n.signalSync()
+	n.wakeAllLocked()
 	return e.Index, e.Term, true
 }
 
-func (n *Node) afterLocalAppendLocked() {
-	if len(n.peers) == 0 {
-		n.advanceCommitLocked()
-		return
+func (n *Node) signalSync() {
+	select {
+	case n.syncCh <- struct{}{}:
+	default:
 	}
-	n.wakeAllLocked()
+}
+
+// syncLoop group-commits the leader's log: every wakeup fsyncs whatever has
+// been appended so far, then lets the commit index advance.
+func (n *Node) syncLoop() {
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-n.syncCh:
+		}
+		n.mu.Lock()
+		target, term, leader := n.log.lastIndex(), n.term, n.role == Leader
+		n.mu.Unlock()
+
+		err := n.cfg.Storage.Sync()
+
+		n.mu.Lock()
+		n.mustPersist(err)
+		// Only trust target if we have been leader of the same term the whole
+		// time: a leader never truncates its own log within a term.
+		if leader && n.role == Leader && n.term == term && target > n.durableIndex {
+			n.durableIndex = target
+			n.advanceCommitLocked()
+		}
+		n.mu.Unlock()
+	}
 }
 
 // goLocked starts f as a tracked goroutine. mu must be held.

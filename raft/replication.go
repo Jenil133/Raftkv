@@ -130,8 +130,12 @@ func (n *Node) replicateOnce(peer NodeID, term uint64) (stillLeader, more bool) 
 // advanceCommitLocked moves commitIndex to the highest index replicated on a
 // quorum whose entry is from the current term.
 func (n *Node) advanceCommitLocked() {
+	self := n.durableIndex
+	if last := n.log.lastIndex(); self > last {
+		self = last
+	}
 	matches := make([]uint64, 0, len(n.peers)+1)
-	matches = append(matches, n.log.lastIndex())
+	matches = append(matches, self)
 	for _, p := range n.peers {
 		matches = append(matches, n.matchIndex[p])
 	}

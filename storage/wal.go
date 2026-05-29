@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/Jenil133/raftkv/raft"
 )
@@ -36,6 +37,14 @@ type WAL struct {
 	f     *os.File
 	w     *bufio.Writer
 	dirty bool
+	// Group commit: every flush bumps writeSeq; an fsync started after a
+	// flush makes it durable and advances syncedSeq. syncMu serialises
+	// fsyncs (and file swaps) without blocking appends.
+	syncMu    sync.Mutex
+	writeSeq  uint64
+	syncedSeq uint64
+	// SyncObserver, if set, is told how long each fsync took.
+	SyncObserver func(time.Duration)
 	// state replayed at open, handed out once by Load.
 	loaded raft.State
 	// NoSync skips fsync; useful for benchmarks and tests.
@@ -236,35 +245,74 @@ func (w *WAL) TruncateFrom(index uint64) error {
 	return w.writeRecord(recTruncate, p[:])
 }
 
+// Sync makes every record written so far durable. Concurrent callers share
+// fsyncs: whoever finds an fsync in flight waits for it and returns without
+// issuing another if that one already covered their writes.
 func (w *WAL) Sync() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.syncLocked()
-}
+	if w.dirty {
+		if err := w.w.Flush(); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+		w.dirty = false
+		w.writeSeq++
+	}
+	target := w.writeSeq
+	done := w.syncedSeq >= target
+	w.mu.Unlock()
+	if done {
+		return nil
+	}
 
-func (w *WAL) syncLocked() error {
-	if !w.dirty {
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
+	w.mu.Lock()
+	if w.syncedSeq >= target {
+		w.mu.Unlock()
 		return nil
 	}
-	if err := w.w.Flush(); err != nil {
-		return err
+	// Flush anything appended while we queued so this fsync covers it too.
+	if w.dirty {
+		if err := w.w.Flush(); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+		w.dirty = false
+		w.writeSeq++
 	}
-	w.dirty = false
-	if w.NoSync {
-		return nil
+	cover, f := w.writeSeq, w.f
+	w.mu.Unlock()
+
+	if !w.NoSync {
+		start := time.Now()
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		if w.SyncObserver != nil {
+			w.SyncObserver(time.Since(start))
+		}
 	}
-	return w.f.Sync()
+	w.mu.Lock()
+	if cover > w.syncedSeq {
+		w.syncedSeq = cover
+	}
+	w.mu.Unlock()
+	return nil
 }
 
 // SaveSnapshot stores snap, then rewrites the log file without the entries it
 // covers. If we crash in between, OpenWAL discards the covered entries.
 func (w *WAL) SaveSnapshot(snap raft.Snapshot) error {
+	w.syncMu.Lock() // no fsync may run on the file we are about to replace
+	defer w.syncMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.w.Flush(); err != nil {
 		return err
 	}
 	w.dirty = false
+	w.writeSeq++
 	if err := writeSnapshotFile(w.dir, snap, !w.NoSync); err != nil {
 		return err
 	}
@@ -318,6 +366,7 @@ func (w *WAL) SaveSnapshot(snap raft.Snapshot) error {
 	}
 	w.f = tmp
 	w.w = bufio.NewWriterSize(tmp, 1<<20)
+	w.syncedSeq = w.writeSeq // the rewritten file was fsynced with everything
 	return nil
 }
 

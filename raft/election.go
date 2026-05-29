@@ -141,13 +141,14 @@ func (n *Node) becomeLeaderLocked() {
 	// terms (Raft §5.4.2) and enables linearizable reads.
 	n.appendLocked(Entry{Term: n.term, Index: last + 1, Type: EntryNoop})
 	n.syncLocked()
+	n.durableIndex = n.log.lastIndex()
 
 	term := n.term
 	for _, p := range n.peers {
 		p, wake := p, n.wake[p]
 		n.goLocked(func() { n.replicator(p, term, wake) })
 	}
-	n.afterLocalAppendLocked()
+	n.advanceCommitLocked() // single-node groups commit immediately
 }
 
 // HandleRequestVote implements Handler.
