@@ -3,8 +3,11 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +66,7 @@ func (g *gcluster) start(id raft.NodeID, l net.Listener) {
 		Peers:              g.addrs,
 		DataDir:            filepath.Join(g.dir, fmt.Sprintf("node%d", id)),
 		Shards:             g.shards,
+		MetricsAddr:        "127.0.0.1:0",
 		SnapshotEvery:      g.snapEvery,
 		NoSync:             true,
 		ElectionTimeoutMin: 150 * time.Millisecond,
@@ -245,5 +249,72 @@ func TestGRPCShardsSnapshotsAndDocs(t *testing.T) {
 	}
 	if r, err := g.docClient(2).Get(ctx, &docpb.GetRequest{Collection: "users", Id: "ann"}); err != nil || r.Code != docpb.Code_OK {
 		t.Fatalf("doc get after restart: %+v %v", r, err)
+	}
+}
+
+func TestMetricsEndpoints(t *testing.T) {
+	g := newGRPCCluster(t, 3, 2, 0)
+	cl := g.client()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for i := 0; i < 10; i++ {
+		if err := cl.Put(ctx, fmt.Sprintf("m%d", i), []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := g.nodes[1]
+	base := "http://" + d.MetricsAddr()
+
+	get := func(path string) (int, string) {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+	if code, _ := get("/healthz"); code != 200 {
+		t.Fatalf("/healthz = %d", code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, _ := get("/readyz")
+		if code == 200 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/readyz never became ready (last %d)", code)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_, body := get("/metrics")
+	for _, want := range []string{
+		`raftkv_raft_term{node="1",shard="0"}`,
+		`raftkv_raft_commit_index{node="1",shard="1"}`,
+		`raftkv_raft_is_leader{node="1",shard="0"}`,
+		`raftkv_wal_fsync_duration_seconds_bucket`,
+		`go_goroutines`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %s", want)
+		}
+	}
+	// Requests are recorded on whichever node led the shard.
+	var total int
+	for _, n := range g.nodes {
+		_, b := func() (int, string) {
+			resp, err := http.Get("http://" + n.MetricsAddr() + "/metrics")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			x, _ := io.ReadAll(resp.Body)
+			return resp.StatusCode, string(x)
+		}()
+		total += strings.Count(b, `raftkv_request_duration_seconds_count{op="put"`)
+	}
+	if total == 0 {
+		t.Fatal("no put latencies recorded on any node")
 	}
 }

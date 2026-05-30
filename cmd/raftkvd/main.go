@@ -23,6 +23,7 @@ func main() {
 		dataDir   = flag.String("data", "", "directory for the write-ahead log (default: ./data/node<id>)")
 		shards    = flag.Int("shards", 4, "number of Raft groups (must match on every node)")
 		snapEvery = flag.Uint64("snapshot-every", 10000, "snapshot each shard after this many applied entries (0 disables)")
+		metricsAt = flag.String("metrics", "", "address for the HTTP /metrics, /healthz and /readyz endpoints (e.g. :9100)")
 		noSync    = flag.Bool("no-sync", false, "skip fsync (unsafe; benchmarks only)")
 		election  = flag.Duration("election-timeout", 300*time.Millisecond, "minimum election timeout")
 		heartbeat = flag.Duration("heartbeat", 50*time.Millisecond, "leader heartbeat interval")
@@ -62,6 +63,7 @@ func main() {
 		Shards:             *shards,
 		SnapshotEvery:      *snapEvery,
 		NoSync:             *noSync,
+		MetricsAddr:        *metricsAt,
 		ElectionTimeoutMin: *election,
 		HeartbeatInterval:  *heartbeat,
 		Logger:             logger,
@@ -70,7 +72,7 @@ func main() {
 		logger.Error("start failed", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("node started", "id", *id, "addr", d.Addr(), "data", *dataDir)
+	logger.Info("node started", "id", *id, "addr", d.Addr(), "data", *dataDir, "shards", *shards, "metrics", d.MetricsAddr())
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

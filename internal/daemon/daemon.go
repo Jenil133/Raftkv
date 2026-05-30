@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"path/filepath"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Jenil133/raftkv/doc"
 	"github.com/Jenil133/raftkv/kv"
+	"github.com/Jenil133/raftkv/metrics"
 	"github.com/Jenil133/raftkv/proto/docpb"
 	"github.com/Jenil133/raftkv/proto/kvpb"
 	"github.com/Jenil133/raftkv/raft"
@@ -37,6 +39,9 @@ type Options struct {
 	SnapshotEvery uint64
 	// NoSync disables fsync (benchmarks/tests only).
 	NoSync bool
+	// MetricsAddr, if set, serves /metrics, /healthz and /readyz over HTTP.
+	MetricsAddr     string
+	MetricsListener net.Listener // pre-bound alternative to MetricsAddr
 
 	ElectionTimeoutMin time.Duration
 	HeartbeatInterval  time.Duration
@@ -45,7 +50,8 @@ type Options struct {
 
 // Daemon is a running node.
 type Daemon struct {
-	Host *shard.Host
+	Host    *shard.Host
+	Metrics *metrics.Registry
 
 	grpc      *grpc.Server
 	transport *grpctransport.Transport
@@ -53,6 +59,9 @@ type Daemon struct {
 	lis       net.Listener
 	docConns  []*grpc.ClientConn
 	serveDone chan struct{}
+
+	httpSrv *http.Server
+	httpLis net.Listener
 }
 
 // Shard returns the replica of shard g on this node.
@@ -74,7 +83,7 @@ func Start(o Options) (*Daemon, error) {
 		}
 	}
 
-	d := &Daemon{lis: lis, serveDone: make(chan struct{})}
+	d := &Daemon{lis: lis, serveDone: make(chan struct{}), Metrics: metrics.New(o.ID)}
 	fail := func(err error) (*Daemon, error) {
 		for _, g := range d.groups() {
 			g.Raft.Stop()
@@ -105,6 +114,7 @@ func Start(o Options) (*Daemon, error) {
 			return fail(err)
 		}
 		wal.NoSync = o.NoSync
+		wal.SyncObserver = d.Metrics.FsyncObserver(g)
 		d.wals = append(d.wals, wal)
 
 		node, err := raft.NewNode(raft.Config{
@@ -119,12 +129,13 @@ func Start(o Options) (*Daemon, error) {
 		if err != nil {
 			return fail(err)
 		}
-		var kvOpts []kv.Option
+		kvOpts := []kv.Option{kv.WithObserver(d.Metrics.KVObserver(g))}
 		if o.SnapshotEvery > 0 {
 			kvOpts = append(kvOpts, kv.WithSnapshotEvery(o.SnapshotEvery))
 		}
 		groups[g] = shard.Group{Raft: node, KV: kv.NewServer(node, kvOpts...)}
 		router.Handle(uint32(g), node)
+		d.Metrics.AddRaft(g, node)
 	}
 	d.Host = shard.NewHost(groups)
 	kvpb.RegisterKVServer(d.grpc, d.Host)
@@ -142,6 +153,19 @@ func Start(o Options) (*Daemon, error) {
 	}
 	docpb.RegisterDocsServer(d.grpc, doc.NewServer(doc.NewStore(shard.NewClient(eps, o.Shards))))
 
+	if o.MetricsListener != nil || o.MetricsAddr != "" {
+		hl := o.MetricsListener
+		if hl == nil {
+			var err error
+			if hl, err = net.Listen("tcp", o.MetricsAddr); err != nil {
+				return fail(err)
+			}
+		}
+		d.httpLis = hl
+		d.httpSrv = &http.Server{Handler: d.httpHandler(), ReadHeaderTimeout: 5 * time.Second}
+		go d.httpSrv.Serve(hl)
+	}
+
 	for _, g := range groups {
 		g.Raft.Start()
 	}
@@ -150,6 +174,35 @@ func Start(o Options) (*Daemon, error) {
 		d.grpc.Serve(lis)
 	}()
 	return d, nil
+}
+
+func (d *Daemon) httpHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", d.Metrics.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+	// Ready once every shard knows its leader, i.e. the node can serve or
+	// redirect any request.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		for i, g := range d.Host.Groups {
+			if g.Raft.Status().Leader == 0 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprintf(w, "shard %d has no leader\n", i)
+				return
+			}
+		}
+		fmt.Fprintln(w, "ready")
+	})
+	return mux
+}
+
+// MetricsAddr is the address of the HTTP metrics server, if running.
+func (d *Daemon) MetricsAddr() string {
+	if d.httpLis == nil {
+		return ""
+	}
+	return d.httpLis.Addr().String()
 }
 
 func (d *Daemon) groups() []shard.Group {
@@ -164,6 +217,9 @@ func (d *Daemon) Addr() string { return d.lis.Addr().String() }
 
 // Stop shuts everything down in dependency order.
 func (d *Daemon) Stop() {
+	if d.httpSrv != nil {
+		d.httpSrv.Close()
+	}
 	d.grpc.Stop()
 	<-d.serveDone
 	for _, g := range d.Host.Groups {
