@@ -47,6 +47,7 @@ type Server struct {
 	// RequestTimeout caps how long one request may wait on consensus.
 	RequestTimeout time.Duration
 
+	observe       Observer
 	snapshotEvery uint64 // take a snapshot after this many applied entries; 0 = never
 	lastSnapshot  uint64 // index of the newest snapshot (apply loop only)
 
@@ -59,6 +60,13 @@ type Server struct {
 
 // Option configures a Server.
 type Option func(*Server)
+
+// Observer is told the outcome and latency of every request, e.g. to export
+// metrics. op is one of put, get, delete, cas, scan.
+type Observer func(op string, status kvpb.Status, d time.Duration)
+
+// WithObserver installs an Observer.
+func WithObserver(o Observer) Option { return func(s *Server) { s.observe = o } }
 
 // WithSnapshotEvery makes the server snapshot its state (letting Raft discard
 // the covered log prefix) every n applied entries.
@@ -78,6 +86,7 @@ func NewServer(node *raft.Node, opts ...Option) *Server {
 		o(s)
 	}
 	go s.applyLoop()
+	go s.watchLeadership()
 	return s
 }
 
@@ -191,24 +200,39 @@ func (s *Server) execute(ctx context.Context, cmd *kvpb.Command) (Result, error)
 	s.waiters[idx] = w
 	s.mu.Unlock()
 
-	t := time.NewTicker(25 * time.Millisecond)
+	select {
+	case r := <-w.ch:
+		if errors.Is(r.err, errLostLeadership) {
+			return Result{}, s.notLeader()
+		}
+		return r.res, r.err
+	case <-ctx.Done():
+		s.dropWaiter(idx, w)
+		return Result{}, ctx.Err()
+	}
+}
+
+// watchLeadership fails pending writes once this node stops leading the term
+// they were proposed in. Their entries may or may not commit; the client
+// retries with the same sequence number, which dedupe makes safe.
+func (s *Server) watchLeadership() {
+	t := time.NewTicker(20 * time.Millisecond)
 	defer t.Stop()
 	for {
 		select {
-		case r := <-w.ch:
-			if errors.Is(r.err, errLostLeadership) {
-				return Result{}, s.notLeader()
-			}
-			return r.res, r.err
-		case <-ctx.Done():
-			s.dropWaiter(idx, w)
-			return Result{}, ctx.Err()
+		case <-s.done:
+			return
 		case <-t.C:
-			if st := s.node.Status(); st.Term != term || st.Role != raft.Leader {
-				s.dropWaiter(idx, w)
-				return Result{}, s.notLeader()
+		}
+		st := s.node.Status()
+		s.mu.Lock()
+		for idx, w := range s.waiters {
+			if st.Role != raft.Leader || st.Term != w.term {
+				delete(s.waiters, idx)
+				w.ch <- applyResult{err: errLostLeadership}
 			}
 		}
+		s.mu.Unlock()
 	}
 }
 
@@ -258,6 +282,12 @@ func (s *Server) withTimeout(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(ctx, s.RequestTimeout)
 }
 
+func (s *Server) record(op string, st kvpb.Status, start time.Time) {
+	if s.observe != nil {
+		s.observe(op, st, time.Since(start))
+	}
+}
+
 // classify turns an error into a response status and leader hint.
 func classify(err error) (kvpb.Status, uint64, string) {
 	if err == nil {
@@ -278,6 +308,7 @@ func classify(err error) (kvpb.Status, uint64, string) {
 func (s *Server) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanResponse, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+	start := time.Now()
 	idx, err := s.node.ReadIndex(ctx)
 	if err == nil {
 		err = s.waitApplied(ctx, idx)
@@ -285,6 +316,7 @@ func (s *Server) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanRes
 		err = s.notLeader()
 	}
 	st, hint, msg := classify(err)
+	s.record("scan", st, start)
 	resp := &kvpb.ScanResponse{Status: st, LeaderHint: hint, Error: msg}
 	if err == nil {
 		resp.Pairs = s.store.Scan(req.Prefix, req.After, int(req.Limit))
@@ -295,40 +327,48 @@ func (s *Server) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanRes
 func (s *Server) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResponse, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+	start := time.Now()
 	_, err := s.execute(ctx, &kvpb.Command{
 		Op: kvpb.Op_PUT, Key: req.Key, Value: req.Value, ClientId: req.ClientId, Seq: req.Seq,
 	})
 	st, hint, msg := classify(err)
+	s.record("put", st, start)
 	return &kvpb.PutResponse{Status: st, LeaderHint: hint, Error: msg}, nil
 }
 
 func (s *Server) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetResponse, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+	start := time.Now()
 	v, found, err := s.read(ctx, req.Key)
 	st, hint, msg := classify(err)
+	s.record("get", st, start)
 	return &kvpb.GetResponse{Status: st, LeaderHint: hint, Error: msg, Found: found, Value: v}, nil
 }
 
 func (s *Server) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.DeleteResponse, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+	start := time.Now()
 	res, err := s.execute(ctx, &kvpb.Command{
 		Op: kvpb.Op_DELETE, Key: req.Key, ClientId: req.ClientId, Seq: req.Seq,
 	})
 	st, hint, msg := classify(err)
+	s.record("delete", st, start)
 	return &kvpb.DeleteResponse{Status: st, LeaderHint: hint, Error: msg, Existed: res.Found}, nil
 }
 
 func (s *Server) CAS(ctx context.Context, req *kvpb.CASRequest) (*kvpb.CASResponse, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+	start := time.Now()
 	res, err := s.execute(ctx, &kvpb.Command{
 		Op: kvpb.Op_CAS, Key: req.Key, Value: req.Value, Expected: req.Expected,
 		ExpectAbsent: req.ExpectAbsent, DeleteOnMatch: req.DeleteOnMatch,
 		ClientId: req.ClientId, Seq: req.Seq,
 	})
 	st, hint, msg := classify(err)
+	s.record("cas", st, start)
 	return &kvpb.CASResponse{
 		Status: st, LeaderHint: hint, Error: msg,
 		Swapped: res.Swapped, Found: res.Found, Current: res.Value,
