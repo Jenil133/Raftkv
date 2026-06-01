@@ -31,6 +31,7 @@ type Network struct {
 	blocked  map[link]bool
 	isolated map[raft.NodeID]bool
 	dropRate float64
+	dupRate  float64
 	minDelay time.Duration
 	maxDelay time.Duration
 	rng      *rand.Rand
@@ -124,6 +125,15 @@ func (n *Network) SetDropRate(p float64) {
 	n.mu.Unlock()
 }
 
+// SetDupRate delivers each request a second time, after a random delay, with
+// probability p. The duplicate's reply is discarded, as a retransmitted
+// packet's would be.
+func (n *Network) SetDupRate(p float64) {
+	n.mu.Lock()
+	n.dupRate = p
+	n.mu.Unlock()
+}
+
 // SetDelay adds a uniformly random one-way delay in [min, max].
 func (n *Network) SetDelay(min, max time.Duration) {
 	n.mu.Lock()
@@ -146,30 +156,38 @@ type endpoint struct {
 }
 
 func (e *endpoint) RequestVote(ctx context.Context, to raft.NodeID, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
-	var reply *raft.RequestVoteReply
-	err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (err error) {
+	r, err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (any, error) {
 		a := *args
-		reply, err = h.HandleRequestVote(&a)
-		return err
+		return h.HandleRequestVote(&a)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return reply, nil
+	return r.(*raft.RequestVoteReply), nil
 }
 
 func (e *endpoint) AppendEntries(ctx context.Context, to raft.NodeID, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
-	var reply *raft.AppendEntriesReply
-	err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (err error) {
+	r, err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (any, error) {
 		a := *args
 		a.Entries = append([]raft.Entry(nil), args.Entries...)
-		reply, err = h.HandleAppendEntries(&a)
-		return err
+		return h.HandleAppendEntries(&a)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return reply, nil
+	return r.(*raft.AppendEntriesReply), nil
+}
+
+func (e *endpoint) InstallSnapshot(ctx context.Context, to raft.NodeID, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	r, err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (any, error) {
+		a := *args
+		a.Data = append([]byte(nil), args.Data...)
+		return h.HandleInstallSnapshot(&a)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return r.(*raft.InstallSnapshotReply), nil
 }
 
 func (n *Network) reachable(group uint32, from, to raft.NodeID) (raft.Handler, bool) {
@@ -182,14 +200,17 @@ func (n *Network) reachable(group uint32, from, to raft.NodeID) (raft.Handler, b
 	return h, true
 }
 
-func (n *Network) lossy() (drop bool, delay time.Duration) {
+func (n *Network) lossy() (drop, dup bool, delay time.Duration) {
 	n.mu.RLock()
-	p, lo, hi := n.dropRate, n.minDelay, n.maxDelay
+	p, pd, lo, hi := n.dropRate, n.dupRate, n.minDelay, n.maxDelay
 	n.mu.RUnlock()
 	n.rngMu.Lock()
 	defer n.rngMu.Unlock()
 	if p > 0 && n.rng.Float64() < p {
 		drop = true
+	}
+	if pd > 0 && n.rng.Float64() < pd {
+		dup = true
 	}
 	if hi > 0 {
 		delay = lo
@@ -214,49 +235,45 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (e *endpoint) InstallSnapshot(ctx context.Context, to raft.NodeID, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
-	var reply *raft.InstallSnapshotReply
-	err := e.net.deliver(ctx, e.group, e.from, to, func(h raft.Handler) (err error) {
-		a := *args
-		a.Data = append([]byte(nil), args.Data...)
-		reply, err = h.HandleInstallSnapshot(&a)
-		return err
-	})
+// deliver models request -> handler -> reply with faults on each leg.
+func (n *Network) deliver(ctx context.Context, group uint32, from, to raft.NodeID, invoke func(raft.Handler) (any, error)) (any, error) {
+	h, ok := n.reachable(group, from, to)
+	if !ok {
+		return nil, ErrUnreachable
+	}
+	drop, dup, delay := n.lossy()
+	if drop {
+		return nil, ErrUnreachable
+	}
+	if dup {
+		_, _, d2 := n.lossy()
+		go func() {
+			time.Sleep(d2 + time.Millisecond)
+			if h, ok := n.reachable(group, from, to); ok {
+				invoke(h) // reply of the duplicate is lost
+			}
+		}()
+	}
+	if err := sleep(ctx, delay); err != nil {
+		return nil, err
+	}
+	if h, ok = n.reachable(group, from, to); !ok {
+		return nil, ErrUnreachable
+	}
+	reply, err := invoke(h)
 	if err != nil {
 		return nil, err
 	}
-	return reply, nil
-}
-
-// deliver models request -> handler -> reply with faults on each leg.
-func (n *Network) deliver(ctx context.Context, group uint32, from, to raft.NodeID, call func(raft.Handler) error) error {
-	h, ok := n.reachable(group, from, to)
-	if !ok {
-		return ErrUnreachable
-	}
-	drop, delay := n.lossy()
-	if drop {
-		return ErrUnreachable
-	}
-	if err := sleep(ctx, delay); err != nil {
-		return err
-	}
-	if h, ok = n.reachable(group, from, to); !ok {
-		return ErrUnreachable
-	}
-	if err := call(h); err != nil {
-		return err
-	}
 	// Reply leg.
-	drop, delay = n.lossy()
+	drop, _, delay = n.lossy()
 	if drop {
-		return ErrUnreachable
+		return nil, ErrUnreachable
 	}
 	if err := sleep(ctx, delay); err != nil {
-		return err
+		return nil, err
 	}
 	if _, ok = n.reachable(group, to, from); !ok {
-		return ErrUnreachable
+		return nil, ErrUnreachable
 	}
-	return nil
+	return reply, nil
 }

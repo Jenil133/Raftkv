@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"testing"
 	"time"
 
 	"google.golang.org/grpc"
@@ -29,14 +28,23 @@ type Member struct {
 	KV       *kv.Server
 }
 
+// TB is the subset of testing.TB the cluster needs, so it can also run
+// outside tests (see Runner).
+type TB interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Cleanup(func())
+}
+
 // Cluster is a set of members sharing a simulated network.
 type Cluster struct {
-	t   testing.TB
+	t   TB
 	Net *memnet.Network
 	IDs []raft.NodeID
 
 	shards        int
 	snapshotEvery uint64
+	netSeed       int64
 	cfg           func(*raft.Config)
 
 	mu      sync.Mutex
@@ -54,21 +62,25 @@ func WithRaftConfig(f func(*raft.Config)) Option {
 // WithShards runs n Raft groups per node.
 func WithShards(n int) Option { return func(c *Cluster) { c.shards = n } }
 
+// WithNetSeed seeds the simulated network's fault randomness.
+func WithNetSeed(seed int64) Option { return func(c *Cluster) { c.netSeed = seed } }
+
 // WithSnapshotEvery enables snapshots/compaction every n applied entries.
 func WithSnapshotEvery(n uint64) Option { return func(c *Cluster) { c.snapshotEvery = n } }
 
 // New starts an n-node cluster and stops it when the test ends.
-func New(t testing.TB, n int, opts ...Option) *Cluster {
+func New(t TB, n int, opts ...Option) *Cluster {
 	t.Helper()
 	c := &Cluster{
 		t:       t,
-		Net:     memnet.New(time.Now().UnixNano()),
 		shards:  1,
+		netSeed: time.Now().UnixNano(),
 		members: make(map[raft.NodeID]*Member),
 	}
 	for _, o := range opts {
 		o(c)
 	}
+	c.Net = memnet.New(c.netSeed)
 	for i := 1; i <= n; i++ {
 		c.IDs = append(c.IDs, raft.NodeID(i))
 	}
@@ -353,4 +365,39 @@ func (e *endpoint) Scan(ctx context.Context, in *kvpb.ScanRequest, _ ...grpc.Cal
 		return nil, err
 	}
 	return h.Scan(ctx, in)
+}
+
+// Runner implements TB for use outside tests: Fatalf panics with a
+// *FatalError and Close runs the registered cleanups.
+type Runner struct {
+	mu       sync.Mutex
+	cleanups []func()
+}
+
+// FatalError is the panic value Runner.Fatalf raises.
+type FatalError struct{ Msg string }
+
+func (e *FatalError) Error() string { return e.Msg }
+
+func (r *Runner) Helper() {}
+
+func (r *Runner) Fatalf(format string, args ...any) {
+	panic(&FatalError{Msg: fmt.Sprintf(format, args...)})
+}
+
+func (r *Runner) Cleanup(f func()) {
+	r.mu.Lock()
+	r.cleanups = append(r.cleanups, f)
+	r.mu.Unlock()
+}
+
+// Close runs cleanups in reverse registration order.
+func (r *Runner) Close() {
+	r.mu.Lock()
+	fs := r.cleanups
+	r.cleanups = nil
+	r.mu.Unlock()
+	for i := len(fs) - 1; i >= 0; i-- {
+		fs[i]()
+	}
 }
