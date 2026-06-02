@@ -15,7 +15,9 @@ package lincheck
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math"
+	"math/rand"
 	"sort"
 	"strings"
 )
@@ -100,11 +102,13 @@ type Result struct {
 	OK bool
 	// Unknown is set when the search hit its budget without an answer.
 	Unknown bool
-	// For a failure: the offending key, its history sorted by call time, and
-	// the longest prefix of it the search managed to linearize.
+	// For a failure: the offending key, its history sorted by call time, the
+	// longest prefix of it the search managed to linearize, and the first
+	// completed operation that could not be placed after that prefix.
 	Key        string
 	History    []Operation
 	Linearized []Operation
+	Blocked    *Operation
 	Explored   int
 }
 
@@ -116,14 +120,30 @@ func (r Result) String() string {
 		return fmt.Sprintf("unknown: search budget exhausted on key %q after %d states", r.Key, r.Explored)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "NOT linearizable on key %q (%d ops)\n", r.Key, len(r.History))
-	b.WriteString("history (by call time):\n")
-	for _, o := range r.History {
+	fmt.Fprintf(&b, "NOT linearizable on key %q (%d ops on this key)\n", r.Key, len(r.History))
+	lin := r.Linearized
+	if len(lin) > 20 {
+		fmt.Fprintf(&b, "longest linearizable order found: %d ops, last 20:\n", len(lin))
+		lin = lin[len(lin)-20:]
+	} else {
+		fmt.Fprintf(&b, "longest linearizable order found (%d ops):\n", len(lin))
+	}
+	for _, o := range lin {
 		fmt.Fprintf(&b, "  %s\n", o)
 	}
-	fmt.Fprintf(&b, "longest linearizable order found (%d ops):\n", len(r.Linearized))
-	for _, o := range r.Linearized {
-		fmt.Fprintf(&b, "  %s\n", o)
+	if r.Blocked != nil {
+		fmt.Fprintf(&b, "cannot be linearized next:\n  %s\n", *r.Blocked)
+		b.WriteString("operations concurrent with it:\n")
+		shown := 0
+		for _, o := range r.History {
+			if o.Call <= r.Blocked.Return && (o.Pending || o.Return >= r.Blocked.Call) && o != *r.Blocked {
+				fmt.Fprintf(&b, "  %s\n", o)
+				if shown++; shown == 40 {
+					b.WriteString("  ...\n")
+					break
+				}
+			}
+		}
 	}
 	return b.String()
 }
@@ -243,19 +263,31 @@ func unlift(e *event) {
 	}
 }
 
-type bitset []uint64
+// Memo keys use Zobrist hashing: each op gets two random 64-bit words, and
+// the set of linearized ops is the XOR of its members' words, updated in O(1).
+// Combined with a hash of the model state this gives a 128-bit key; a false
+// collision would need a 2^-128-scale accident.
+type zobrist struct {
+	a, b []uint64
+}
 
-func (b bitset) set(i int)   { b[i/64] |= 1 << (i % 64) }
-func (b bitset) clear(i int) { b[i/64] &^= 1 << (i % 64) }
-func (b bitset) key() string {
-	var sb strings.Builder
-	sb.Grow(len(b) * 8)
-	for _, w := range b {
-		for j := 0; j < 8; j++ {
-			sb.WriteByte(byte(w >> (8 * j)))
-		}
+func newZobrist(n int) zobrist {
+	rng := rand.New(rand.NewSource(int64(n)*7919 + 1))
+	z := zobrist{a: make([]uint64, n), b: make([]uint64, n)}
+	for i := 0; i < n; i++ {
+		z.a[i], z.b[i] = rng.Uint64(), rng.Uint64()
 	}
-	return sb.String()
+	return z
+}
+
+type memoKey [2]uint64
+
+func stateHash(s state) memoKey {
+	h1 := fnv.New64a()
+	h1.Write([]byte(s.encode()))
+	h2 := fnv.New64()
+	h2.Write([]byte(s.encode()))
+	return memoKey{h1.Sum64(), h2.Sum64()}
 }
 
 type frame struct {
@@ -291,10 +323,15 @@ func checkKey(key string, ops []Operation, budget int) Result {
 		prev = e
 	}
 
-	lin := make(bitset, (len(ops)+63)/64)
-	seen := map[string]struct{}{}
+	z := newZobrist(len(ops))
+	var lin memoKey // Zobrist hash of the linearized set
+	seen := map[memoKey]struct{}{}
 	var stack []frame
+	// best is the longest stack seen; bestValid is how much of best still
+	// matches the current stack, so recording a new best copies only the
+	// part that changed since the last one.
 	var best []frame
+	bestValid := 0
 	cur := state{}
 	explored := 0
 
@@ -304,8 +341,10 @@ func checkKey(key string, ops []Operation, budget int) Result {
 			op := &ops[e.op]
 			next, ok := step(cur, op)
 			if ok {
-				lin.set(e.op)
-				k := lin.key() + next.encode()
+				lin[0] ^= z.a[e.op]
+				lin[1] ^= z.b[e.op]
+				sh := stateHash(next)
+				k := memoKey{lin[0] ^ sh[0], lin[1] ^ sh[1]}
 				if _, dup := seen[k]; !dup {
 					seen[k] = struct{}{}
 					explored++
@@ -314,14 +353,16 @@ func checkKey(key string, ops []Operation, budget int) Result {
 					}
 					stack = append(stack, frame{e, cur})
 					if len(stack) > len(best) {
-						best = append(best[:0], stack...)
+						best = append(best[:bestValid], stack[bestValid:]...)
+						bestValid = len(best)
 					}
 					cur = next
 					lift(e)
 					e = head.next
 					continue
 				}
-				lin.clear(e.op)
+				lin[0] ^= z.a[e.op]
+				lin[1] ^= z.b[e.op]
 			}
 			e = e.next
 			continue
@@ -332,18 +373,43 @@ func checkKey(key string, ops []Operation, budget int) Result {
 			return Result{OK: true, Explored: explored}
 		}
 		if len(stack) == 0 {
-			lin := make([]Operation, len(best))
-			for i, f := range best {
-				lin[i] = ops[f.call.op]
-			}
-			return Result{Key: key, History: ops, Linearized: lin, Explored: explored}
+			return failure(key, ops, best, explored)
 		}
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+		if len(stack) < bestValid {
+			bestValid = len(stack)
+		}
 		cur = top.state
-		lin.clear(top.call.op)
+		lin[0] ^= z.a[top.call.op]
+		lin[1] ^= z.b[top.call.op]
 		unlift(top.call)
 		e = top.call.next
 	}
 	return Result{OK: true, Explored: explored}
+}
+
+// failure builds the report: the best linearization found and the earliest
+// completed op left over after it.
+func failure(key string, ops []Operation, best []frame, explored int) Result {
+	r := Result{Key: key, History: ops, Explored: explored, Linearized: make([]Operation, len(best))}
+	done := make([]bool, len(ops))
+	for i, f := range best {
+		r.Linearized[i] = ops[f.call.op]
+		done[f.call.op] = true
+	}
+	var blocked *Operation
+	for i := range ops {
+		if done[i] || ops[i].Pending {
+			continue
+		}
+		if blocked == nil || ops[i].Return < blocked.Return {
+			blocked = &ops[i]
+		}
+	}
+	if blocked != nil {
+		cp := *blocked
+		r.Blocked = &cp
+	}
+	return r
 }
