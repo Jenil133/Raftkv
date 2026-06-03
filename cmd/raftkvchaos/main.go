@@ -92,6 +92,11 @@ func main() {
 			}
 			if *verbose {
 				fmt.Print(rep.String())
+				if rep.OK() {
+					for _, f := range rep.Faults {
+						fmt.Printf("    %s\n", f)
+					}
+				}
 			}
 			mu.Unlock()
 			finished.Add(1)

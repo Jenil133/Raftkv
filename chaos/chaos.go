@@ -52,13 +52,16 @@ func RandomConfig(seed int64) Config {
 		Clients:       3 + rng.Intn(4),
 		Keys:          2 + rng.Intn(4),
 		FaultPhase:    time.Duration(400+rng.Intn(500)) * time.Millisecond,
-		OpTimeout:     2 * time.Second,
+		// Short timeouts leave operations indeterminate (the client gives up
+		// without knowing whether the write happened), which the checker
+		// must handle.
+		OpTimeout: []time.Duration{2 * time.Second, 2 * time.Second, 300 * time.Millisecond}[rng.Intn(3)],
 	}
 }
 
 func (c Config) String() string {
-	return fmt.Sprintf("seed=%d nodes=%d shards=%d snapshotEvery=%d clients=%d keys=%d faultPhase=%v buggyReads=%v",
-		c.Seed, c.Nodes, c.Shards, c.SnapshotEvery, c.Clients, c.Keys, c.FaultPhase, c.BuggyReads)
+	return fmt.Sprintf("seed=%d nodes=%d shards=%d snapshotEvery=%d clients=%d keys=%d faultPhase=%v opTimeout=%v buggyReads=%v",
+		c.Seed, c.Nodes, c.Shards, c.SnapshotEvery, c.Clients, c.Keys, c.FaultPhase, c.OpTimeout, c.BuggyReads)
 }
 
 // Report is the outcome of one run.
@@ -287,7 +290,7 @@ func injectFaults(c *cluster.Cluster, cfg Config, rng *rand.Rand, h *history) []
 	deadline := time.Now().Add(cfg.FaultPhase)
 	for time.Now().Before(deadline) {
 		time.Sleep(time.Duration(20+rng.Intn(100)) * time.Millisecond)
-		switch rng.Intn(11) {
+		switch rng.Intn(12) {
 		case 0, 1: // crash a random node
 			if len(down) < maxDown {
 				id := pick(upNodes())
@@ -344,6 +347,17 @@ func injectFaults(c *cluster.Cluster, cfg Config, rng *rand.Rand, h *history) []
 		case 10:
 			c.Net.SetDupRate(0.2)
 			note("duplicate 20%% of messages")
+		case 11: // power loss: every node dies at once, unsynced writes vanish
+			if rng.Intn(3) == 0 {
+				for _, id := range c.IDs {
+					c.Crash(id)
+				}
+				for _, id := range c.IDs {
+					c.Restart(id)
+				}
+				down = map[raft.NodeID]bool{}
+				note("power loss: crash and restart all nodes")
+			}
 		}
 	}
 	c.Net.Heal()
