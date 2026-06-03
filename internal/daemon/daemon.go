@@ -39,6 +39,8 @@ type Options struct {
 	SnapshotEvery uint64
 	// NoSync disables fsync (benchmarks/tests only).
 	NoSync bool
+	// SyncMode is the WAL durability barrier (see storage.SyncMode).
+	SyncMode storage.SyncMode
 	// MetricsAddr, if set, serves /metrics, /healthz and /readyz over HTTP.
 	MetricsAddr     string
 	MetricsListener net.Listener // pre-bound alternative to MetricsAddr
@@ -114,6 +116,7 @@ func Start(o Options) (*Daemon, error) {
 			return fail(err)
 		}
 		wal.NoSync = o.NoSync
+		wal.Barrier = o.SyncMode
 		wal.SyncObserver = d.Metrics.FsyncObserver(g)
 		d.wals = append(d.wals, wal)
 

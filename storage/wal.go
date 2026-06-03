@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Jenil133/raftkv/raft"
@@ -49,6 +50,39 @@ type WAL struct {
 	loaded raft.State
 	// NoSync skips fsync; useful for benchmarks and tests.
 	NoSync bool
+	// Barrier selects how Sync reaches the disk; see SyncMode.
+	Barrier SyncMode
+}
+
+// SyncMode chooses the durability barrier. On Linux both modes issue fsync.
+// On macOS, SyncFull uses F_FULLFSYNC, which also flushes the drive's write
+// cache (the only power-loss-safe option there), while SyncFsync issues a
+// plain fsync(2), which macOS lets the drive cache.
+type SyncMode int
+
+const (
+	SyncFull SyncMode = iota
+	SyncFsync
+)
+
+// ParseSyncMode maps "full", "fsync" and "none" to a mode and NoSync flag.
+func ParseSyncMode(s string) (mode SyncMode, noSync bool, err error) {
+	switch s {
+	case "full", "":
+		return SyncFull, false, nil
+	case "fsync":
+		return SyncFsync, false, nil
+	case "none":
+		return SyncFull, true, nil
+	}
+	return 0, false, fmt.Errorf("unknown sync mode %q (want full, fsync or none)", s)
+}
+
+func (w *WAL) barrier(f *os.File) error {
+	if w.Barrier == SyncFsync {
+		return syscall.Fsync(int(f.Fd()))
+	}
+	return f.Sync()
 }
 
 // replayState accumulates records while reading a log file.
@@ -286,7 +320,7 @@ func (w *WAL) Sync() error {
 
 	if !w.NoSync {
 		start := time.Now()
-		if err := f.Sync(); err != nil {
+		if err := w.barrier(f); err != nil {
 			return err
 		}
 		if w.SyncObserver != nil {
