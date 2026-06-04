@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ func main() {
 		endpoints = flag.String("endpoints", "", "benchmark an existing cluster (id=host:port,...) instead of starting one")
 		conns     = flag.Int("conns", 4, "gRPC connections per node")
 		jsonOut   = flag.String("json", "", "also write the result as JSON to this file")
+		snapEvery = flag.Uint64("snapshot-every", 50000, "snapshot each shard after this many entries (in-process mode; 0 disables)")
+		cpuProf   = flag.String("cpuprofile", "", "write a CPU profile of the run to this file")
 	)
 	flag.Parse()
 
@@ -85,7 +88,7 @@ func main() {
 		res.Nodes, res.SyncMode = len(addrs), "external"
 	} else {
 		var stop func()
-		addrs, stop = startCluster(*nodes, *shards, *syncMode)
+		addrs, stop = startCluster(*nodes, *shards, *syncMode, *snapEvery)
 		defer stop()
 		res.InProcess = true
 	}
@@ -145,10 +148,20 @@ func main() {
 	}
 
 	time.Sleep(*warmup)
+	if *cpuProf != "" {
+		f, err := os.Create(*cpuProf)
+		if err != nil {
+			fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+	}
 	measuring.Store(true)
 	start := time.Now()
 	time.Sleep(*duration)
 	measuring.Store(false)
+	if *cpuProf != "" {
+		pprof.StopCPUProfile()
+	}
 	elapsed := time.Since(start)
 	stopFlag.Store(true)
 	wg.Wait()
@@ -187,7 +200,7 @@ func main() {
 	}
 }
 
-func startCluster(n, shards int, syncMode string) (map[raft.NodeID]string, func()) {
+func startCluster(n, shards int, syncMode string, snapEvery uint64) (map[raft.NodeID]string, func()) {
 	mode, noSync, err := storage.ParseSyncMode(syncMode)
 	if err != nil {
 		fatal(err)
@@ -214,7 +227,7 @@ func startCluster(n, shards int, syncMode string) (map[raft.NodeID]string, func(
 			Peers:         addrs,
 			DataDir:       filepath.Join(dir, fmt.Sprintf("node%d", id)),
 			Shards:        shards,
-			SnapshotEvery: 50000,
+			SnapshotEvery: snapEvery,
 			NoSync:        noSync,
 			SyncMode:      mode,
 		})
