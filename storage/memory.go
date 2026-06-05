@@ -87,8 +87,8 @@ func (m *Memory) TruncateFrom(index uint64) error {
 func (m *Memory) SaveSnapshot(snap raft.Snapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if snap.Index < m.snap.Index {
-		return fmt.Errorf("storage: snapshot %d older than stored %d", snap.Index, m.snap.Index)
+	if snap.Index <= m.snap.Index {
+		return nil // an equal or newer snapshot is already stored
 	}
 	// Make everything before the snapshot durable too, so the log stays
 	// contiguous with it.

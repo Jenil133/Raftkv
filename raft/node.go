@@ -90,6 +90,8 @@ type Node struct {
 	lastLeaderContact time.Time
 
 	// Snapshot state. The log offset always equals snapshot.Index.
+	// snapMu serialises snapshot writes to storage; lock order is mu, snapMu.
+	snapMu      sync.Mutex
 	snapshot    Snapshot
 	pendingSnap *Snapshot // snapshot waiting to be handed to the state machine
 	incoming    *incomingSnapshot

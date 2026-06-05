@@ -14,29 +14,47 @@ type incomingSnapshot struct {
 
 // Snapshot is called by the state machine once it has applied every entry up
 // to index and serialised its state into data. The node persists the snapshot
-// and discards the log prefix it covers.
+// and discards the log prefix it covers. Writing the snapshot happens outside
+// the node's main lock, so replication and elections carry on meanwhile.
 func (n *Node) Snapshot(index uint64, data []byte) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.stopped {
+		n.mu.Unlock()
 		return ErrStopped
 	}
 	if index <= n.log.offset {
+		n.mu.Unlock()
 		return nil // already covered by an equal or newer snapshot
 	}
-	// The state machine has applied index, so it is committed.
+	// The state machine has applied index, so it is committed: no leader can
+	// ever truncate it, and the term below stays valid after we unlock.
 	if index > n.commitIndex {
+		n.mu.Unlock()
 		return fmt.Errorf("raft: snapshot index %d beyond commit index %d", index, n.commitIndex)
 	}
 	term, ok := n.log.term(index)
+	n.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("raft: snapshot index %d not in log", index)
 	}
 	snap := Snapshot{Index: index, Term: term, Data: data}
-	n.mustPersist(n.cfg.Storage.SaveSnapshot(snap))
-	n.log.compactTo(index)
-	n.snapshot = snap
-	n.stats.SnapshotsTaken++
+
+	// snapMu orders snapshot writes with installs from a leader; storage
+	// ignores a snapshot older than the one it holds.
+	n.snapMu.Lock()
+	err := n.cfg.Storage.SaveSnapshot(snap)
+	n.snapMu.Unlock()
+	n.mustPersist(err)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if index > n.log.offset {
+		if t, ok := n.log.term(index); ok && t == term {
+			n.log.compactTo(index)
+			n.snapshot = snap
+			n.stats.SnapshotsTaken++
+		}
+	}
 	return nil
 }
 
@@ -175,7 +193,10 @@ func (n *Node) installSnapshotLocked(snap Snapshot) {
 		n.mustPersist(n.cfg.Storage.TruncateFrom(snap.Index + 1))
 		n.log.reset(snap.Index, snap.Term)
 	}
-	n.mustPersist(n.cfg.Storage.SaveSnapshot(snap))
+	n.snapMu.Lock()
+	err := n.cfg.Storage.SaveSnapshot(snap)
+	n.snapMu.Unlock()
+	n.mustPersist(err)
 	n.snapshot = snap
 	if snap.Index > n.commitIndex {
 		n.commitIndex = snap.Index
