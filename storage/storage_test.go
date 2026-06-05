@@ -2,12 +2,20 @@ package storage
 
 import (
 	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/Jenil133/raftkv/raft"
 )
+
+func activeSegment(t *testing.T, dir string) string {
+	t.Helper()
+	segs, err := listSegments(dir)
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("no segments in %s: %v", dir, err)
+	}
+	return segs[len(segs)-1].path
+}
 
 func entries(term uint64, from, n int) []raft.Entry {
 	var out []raft.Entry
@@ -149,7 +157,7 @@ func TestWALTornTailIsDiscarded(t *testing.T) {
 	w.Sync()
 	w.Close()
 
-	path := filepath.Join(dir, walFileName)
+	path := activeSegment(t, dir)
 	info, _ := os.Stat(path)
 	// Chop into the middle of the last record.
 	if err := os.Truncate(path, info.Size()-3); err != nil {
@@ -184,7 +192,7 @@ func TestWALCorruptionStopsReplay(t *testing.T) {
 	w.Sync()
 	w.Close()
 
-	path := filepath.Join(dir, walFileName)
+	path := activeSegment(t, dir)
 	data, _ := os.ReadFile(path)
 	data[len(data)-2] ^= 0xff // flip a bit inside the last record
 	os.WriteFile(path, data, 0o644)
@@ -202,6 +210,7 @@ func TestWALCorruptionStopsReplay(t *testing.T) {
 func TestWALSnapshotCompactsFileAndSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	w, _ := OpenWAL(dir)
+	w.SegmentSize = 8 << 10
 	big := make([]byte, 1024)
 	var es []raft.Entry
 	for i := 1; i <= 100; i++ {
@@ -215,8 +224,8 @@ func TestWALSnapshotCompactsFileAndSurvivesRestart(t *testing.T) {
 	if err := w.SaveSnapshot(raft.Snapshot{Index: 90, Term: 1, Data: []byte("state")}); err != nil {
 		t.Fatal(err)
 	}
-	if after := w.Size(); after >= before/5 {
-		t.Fatalf("log file did not shrink: %d -> %d", before, after)
+	if after := w.Size(); after >= before/4 {
+		t.Fatalf("log did not shrink: %d -> %d bytes", before, after)
 	}
 	// Keep writing on the rewritten file.
 	if err := w.Append([]raft.Entry{{Term: 2, Index: 101, Data: []byte("x")}}); err != nil {
@@ -286,5 +295,93 @@ func TestWALSnapshotBeyondLog(t *testing.T) {
 	st := mustLoad(t, w2)
 	if st.Snapshot.Index != 20 || len(st.Entries) != 2 || st.Entries[0].Index != 21 {
 		t.Fatalf("state: snap=%d entries=%+v", st.Snapshot.Index, st.Entries)
+	}
+}
+
+func TestWALRotatesAndReplaysAcrossSegments(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := OpenWAL(dir)
+	w.SegmentSize = 2 << 10
+	w.SaveHardState(raft.HardState{Term: 7, VotedFor: 2})
+	payload := make([]byte, 300)
+	var es []raft.Entry
+	for i := 1; i <= 60; i++ {
+		es = append(es, raft.Entry{Term: 7, Index: uint64(i), Data: payload})
+	}
+	w.Append(es)
+	w.Sync()
+	if n := w.Segments(); n < 5 {
+		t.Fatalf("expected rotation into several segments, got %d", n)
+	}
+	w.Close()
+
+	w2, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	st := mustLoad(t, w2)
+	if st.HardState != (raft.HardState{Term: 7, VotedFor: 2}) || len(st.Entries) != 60 {
+		t.Fatalf("replay across segments: hs=%+v entries=%d", st.HardState, len(st.Entries))
+	}
+}
+
+func TestWALDeletesOnlyCoveredPrefixOfSegments(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := OpenWAL(dir)
+	w.SegmentSize = 2 << 10
+	payload := make([]byte, 300)
+	var es []raft.Entry
+	for i := 1; i <= 40; i++ {
+		es = append(es, raft.Entry{Term: 1, Index: uint64(i), Data: payload})
+	}
+	w.Append(es)
+	w.Sync()
+	// Truncate back into an old segment and rewrite: the old segment still
+	// holds now-dead entries with high indexes.
+	w.TruncateFrom(10)
+	var es2 []raft.Entry
+	for i := 10; i <= 20; i++ {
+		es2 = append(es2, raft.Entry{Term: 2, Index: uint64(i), Data: payload})
+	}
+	w.Append(es2)
+	w.Sync()
+	// A snapshot at 15 must not delete segments holding dead entries > 15:
+	// deleting them while keeping later ones could resurrect nothing, but
+	// deleting a later one while keeping an earlier one could revive the
+	// truncated entries. Only a covered prefix may go.
+	if err := w.SaveSnapshot(raft.Snapshot{Index: 15, Term: 2, Data: []byte("s")}); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	w2, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	st := mustLoad(t, w2)
+	if len(st.Entries) != 5 || st.Entries[0].Index != 16 || st.Entries[4].Index != 20 {
+		t.Fatalf("entries after compaction: %d, first %+v", len(st.Entries), st.Entries)
+	}
+	for _, e := range st.Entries {
+		if e.Term != 2 {
+			t.Fatalf("truncated entry from term 1 came back: %+v", e)
+		}
+	}
+}
+
+func TestWALIgnoresStaleSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := OpenWAL(dir)
+	w.Append(entries(1, 1, 10))
+	w.Sync()
+	w.SaveSnapshot(raft.Snapshot{Index: 8, Term: 1, Data: []byte("new")})
+	w.SaveSnapshot(raft.Snapshot{Index: 5, Term: 1, Data: []byte("old")})
+	w.Close()
+	w2, _ := OpenWAL(dir)
+	defer w2.Close()
+	if st := mustLoad(t, w2); st.Snapshot.Index != 8 || string(st.Snapshot.Data) != "new" {
+		t.Fatalf("stale snapshot overwrote newer: %+v", st.Snapshot)
 	}
 }

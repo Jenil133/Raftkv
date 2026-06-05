@@ -8,6 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,40 +22,21 @@ const (
 	recHardState byte = 1
 	recEntry     byte = 2
 	recTruncate  byte = 3
+	// recSnapMark records that a snapshot covers every entry up to its index,
+	// so replay drops them and the log may continue at index+1 even when the
+	// snapshot jumped past the end of the log.
+	recSnapMark byte = 4
 
-	walFileName  = "raft.wal"
+	segPrefix    = "wal-"
+	segSuffix    = ".log"
 	snapFileName = "snapshot.bin"
 	recHeader    = 9 // crc32 (4) + type (1) + payload length (4)
+
+	// DefaultSegmentSize is when the WAL rolls over to a new segment file.
+	DefaultSegmentSize = 16 << 20
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
-
-// WAL is a file-backed Storage. The log and hard state live in an append-only
-// file of CRC-protected records; replaying it on open rebuilds them, and a
-// torn final record (crash mid-write) is detected and cut off. The snapshot
-// lives in its own file, replaced atomically. Saving a snapshot also rewrites
-// the log file so the compacted prefix actually frees disk space.
-type WAL struct {
-	mu    sync.Mutex
-	dir   string
-	f     *os.File
-	w     *bufio.Writer
-	dirty bool
-	// Group commit: every flush bumps writeSeq; an fsync started after a
-	// flush makes it durable and advances syncedSeq. syncMu serialises
-	// fsyncs (and file swaps) without blocking appends.
-	syncMu    sync.Mutex
-	writeSeq  uint64
-	syncedSeq uint64
-	// SyncObserver, if set, is told how long each fsync took.
-	SyncObserver func(time.Duration)
-	// state replayed at open, handed out once by Load.
-	loaded raft.State
-	// NoSync skips fsync; useful for benchmarks and tests.
-	NoSync bool
-	// Barrier selects how Sync reaches the disk; see SyncMode.
-	Barrier SyncMode
-}
 
 // SyncMode chooses the durability barrier. On Linux both modes issue fsync.
 // On macOS, SyncFull uses F_FULLFSYNC, which also flushes the drive's write
@@ -78,24 +62,62 @@ func ParseSyncMode(s string) (mode SyncMode, noSync bool, err error) {
 	return 0, false, fmt.Errorf("unknown sync mode %q (want full, fsync or none)", s)
 }
 
-func (w *WAL) barrier(f *os.File) error {
-	if w.Barrier == SyncFsync {
-		return syscall.Fsync(int(f.Fd()))
-	}
-	return f.Sync()
+// segment is one WAL file. Records go to the newest (active) segment; older
+// ones are sealed and only ever deleted, a whole prefix at a time, once a
+// snapshot covers every entry they hold.
+type segment struct {
+	seq       uint64
+	path      string
+	lastIndex uint64   // highest entry index written to it (0 if none)
+	f         *os.File // open while it may still need an fsync
 }
 
-// replayState accumulates records while reading a log file.
+// WAL is a file-backed Storage. The log and hard state live in append-only
+// segment files of CRC-protected records; replaying them on open rebuilds the
+// state, and a torn final record (crash mid-write) is detected and cut off.
+// The snapshot lives in its own file, replaced atomically. Each segment
+// begins with the current hard state, so dropping old segments never loses it.
+type WAL struct {
+	mu         sync.Mutex
+	dir        string
+	segs       []*segment // oldest first; last is active
+	w          *bufio.Writer
+	activeSize int64
+	dirty      bool
+	hs         raft.HardState
+	snapIndex  uint64
+	unsynced   []*os.File // sealed files with data not yet fsynced
+
+	// Group commit: every flush bumps writeSeq; an fsync started after a
+	// flush makes it durable and advances syncedSeq. syncMu serialises
+	// fsyncs and segment deletion without blocking appends.
+	syncMu    sync.Mutex
+	writeSeq  uint64
+	syncedSeq uint64
+
+	loaded raft.State // replayed at open, handed out once by Load
+
+	// NoSync skips fsync; useful for benchmarks and tests.
+	NoSync bool
+	// Barrier selects how Sync reaches the disk.
+	Barrier SyncMode
+	// SyncObserver, if set, is told how long each fsync took.
+	SyncObserver func(time.Duration)
+	// SegmentSize is the size at which a new segment is started.
+	SegmentSize int64
+}
+
+// replayState accumulates records while reading segment files.
 type replayState struct {
 	hs      raft.HardState
 	entries []raft.Entry
 }
 
-func (r *replayState) apply(typ byte, p []byte) error {
+func (r *replayState) apply(typ byte, p []byte) (uint64, error) {
 	switch typ {
 	case recHardState:
 		if len(p) != 16 {
-			return fmt.Errorf("wal: bad hard state record")
+			return 0, fmt.Errorf("wal: bad hard state record")
 		}
 		r.hs = raft.HardState{
 			Term:     binary.LittleEndian.Uint64(p[0:8]),
@@ -103,7 +125,7 @@ func (r *replayState) apply(typ byte, p []byte) error {
 		}
 	case recEntry:
 		if len(p) < 17 {
-			return fmt.Errorf("wal: bad entry record")
+			return 0, fmt.Errorf("wal: bad entry record")
 		}
 		e := raft.Entry{
 			Term:  binary.LittleEndian.Uint64(p[0:8]),
@@ -112,12 +134,13 @@ func (r *replayState) apply(typ byte, p []byte) error {
 			Data:  append([]byte(nil), p[17:]...),
 		}
 		if n := len(r.entries); n > 0 && e.Index != r.entries[n-1].Index+1 {
-			return fmt.Errorf("wal: entry index %d does not follow %d", e.Index, r.entries[n-1].Index)
+			return 0, fmt.Errorf("wal: entry index %d does not follow %d", e.Index, r.entries[n-1].Index)
 		}
 		r.entries = append(r.entries, e)
+		return e.Index, nil
 	case recTruncate:
 		if len(p) != 8 {
-			return fmt.Errorf("wal: bad truncate record")
+			return 0, fmt.Errorf("wal: bad truncate record")
 		}
 		idx := binary.LittleEndian.Uint64(p)
 		if n := len(r.entries); n > 0 && idx <= r.entries[n-1].Index {
@@ -127,44 +150,80 @@ func (r *replayState) apply(typ byte, p []byte) error {
 				r.entries = r.entries[:idx-first]
 			}
 		}
+	case recSnapMark:
+		if len(p) != 8 {
+			return 0, fmt.Errorf("wal: bad snapshot mark record")
+		}
+		idx := binary.LittleEndian.Uint64(p)
+		i := 0
+		for i < len(r.entries) && r.entries[i].Index <= idx {
+			i++
+		}
+		r.entries = r.entries[i:]
 	default:
-		return fmt.Errorf("wal: unknown record type %d", typ)
+		return 0, fmt.Errorf("wal: unknown record type %d", typ)
 	}
-	return nil
+	return 0, nil
 }
 
-// replayFile reads records from r until EOF or the first corrupt record, and
-// returns the byte offset just past the last good record.
-func replayFile(r io.Reader) (*replayState, int64, error) {
+// replayInto reads records from r into st until EOF or the first corrupt
+// record. It returns the offset just past the last good record and the
+// highest entry index seen.
+func replayInto(st *replayState, r io.Reader) (good int64, lastIndex uint64, err error) {
 	br := bufio.NewReaderSize(r, 1<<20)
-	st := &replayState{}
-	var good int64
 	hdr := make([]byte, recHeader)
 	for {
 		if _, err := io.ReadFull(br, hdr); err != nil {
-			return st, good, nil // EOF or torn header
+			return good, lastIndex, nil // EOF or torn header
 		}
 		crc := binary.LittleEndian.Uint32(hdr[0:4])
 		typ := hdr[4]
 		n := binary.LittleEndian.Uint32(hdr[5:9])
 		if n > 1<<30 {
-			return st, good, nil
+			return good, lastIndex, nil
 		}
 		payload := make([]byte, n)
 		if _, err := io.ReadFull(br, payload); err != nil {
-			return st, good, nil
+			return good, lastIndex, nil
 		}
 		h := crc32.New(crcTable)
 		h.Write(hdr[4:9])
 		h.Write(payload)
 		if h.Sum32() != crc {
-			return st, good, nil
+			return good, lastIndex, nil
 		}
-		if err := st.apply(typ, payload); err != nil {
-			return nil, 0, err
+		idx, err := st.apply(typ, payload)
+		if err != nil {
+			return 0, 0, err
+		}
+		if idx > lastIndex {
+			lastIndex = idx
 		}
 		good += int64(recHeader) + int64(n)
 	}
+}
+
+func segName(seq uint64) string { return fmt.Sprintf("%s%016d%s", segPrefix, seq, segSuffix) }
+
+func listSegments(dir string) ([]*segment, error) {
+	names, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var segs []*segment
+	for _, de := range names {
+		name := de.Name()
+		if !strings.HasPrefix(name, segPrefix) || !strings.HasSuffix(name, segSuffix) {
+			continue
+		}
+		seq, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(name, segPrefix), segSuffix), 10, 64)
+		if err != nil {
+			continue
+		}
+		segs = append(segs, &segment{seq: seq, path: filepath.Join(dir, name)})
+	}
+	sort.Slice(segs, func(i, j int) bool { return segs[i].seq < segs[j].seq })
+	return segs, nil
 }
 
 // OpenWAL opens (creating if needed) the WAL in dir and replays it.
@@ -176,39 +235,103 @@ func OpenWAL(dir string) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, walFileName), os.O_RDWR|os.O_CREATE, 0o644)
+	segs, err := listSegments(dir)
 	if err != nil {
 		return nil, err
 	}
-	st, good, err := replayFile(f)
-	if err != nil {
+	w := &WAL{dir: dir, snapIndex: snap.Index, SegmentSize: DefaultSegmentSize}
+	st := &replayState{}
+	for i, sg := range segs {
+		f, err := os.Open(sg.path)
+		if err != nil {
+			return nil, err
+		}
+		good, last, err := replayInto(st, f)
+		info, statErr := f.Stat()
 		f.Close()
-		return nil, err
+		if err != nil {
+			return nil, fmt.Errorf("wal: %s: %w", sg.path, err)
+		}
+		if statErr != nil {
+			return nil, statErr
+		}
+		sg.lastIndex = last
+		if good < info.Size() {
+			if i != len(segs)-1 {
+				return nil, fmt.Errorf("wal: sealed segment %s is corrupt at offset %d", sg.path, good)
+			}
+			// Torn write at the tail of the active segment: cut it off.
+			if err := os.Truncate(sg.path, good); err != nil {
+				return nil, err
+			}
+		}
 	}
-	// A crash between writing the snapshot and rewriting the log leaves
-	// entries the snapshot already covers; drop them.
+	w.hs = st.hs
+
+	// A crash after saving a snapshot can leave entries it already covers.
 	entries := st.entries
 	for len(entries) > 0 && entries[0].Index <= snap.Index {
 		entries = entries[1:]
 	}
 	if len(entries) > 0 && entries[0].Index != snap.Index+1 {
-		f.Close()
 		return nil, fmt.Errorf("wal: log starts at %d but snapshot ends at %d", entries[0].Index, snap.Index)
 	}
-	if err := f.Truncate(good); err != nil {
+	w.loaded = raft.State{HardState: st.hs, Snapshot: snap, Entries: entries}
+
+	if len(segs) == 0 {
+		w.segs = nil
+		if err := w.startSegmentLocked(1); err != nil {
+			return nil, err
+		}
+		return w, nil
+	}
+	active := segs[len(segs)-1]
+	f, err := os.OpenFile(active.path, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	if _, err := f.Seek(good, io.SeekStart); err != nil {
-		f.Close()
-		return nil, err
+	active.f = f
+	w.segs = segs
+	w.activeSize = size
+	w.w = bufio.NewWriterSize(f, 1<<20)
+	return w, nil
+}
+
+// startSegmentLocked creates segment seq, makes it active and writes the
+// current hard state at its head.
+func (w *WAL) startSegmentLocked(seq uint64) error {
+	path := filepath.Join(w.dir, segName(seq))
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
 	}
-	return &WAL{
-		dir:    dir,
-		f:      f,
-		w:      bufio.NewWriterSize(f, 1<<20),
-		loaded: raft.State{HardState: st.hs, Snapshot: snap, Entries: entries},
-	}, nil
+	w.segs = append(w.segs, &segment{seq: seq, path: path, f: f})
+	w.w = bufio.NewWriterSize(f, 1<<20)
+	w.activeSize = 0
+	if !w.NoSync {
+		syncDir(w.dir)
+	}
+	return w.writeRecordLocked(recHardState, hardStatePayload(w.hs))
+}
+
+func (w *WAL) active() *segment { return w.segs[len(w.segs)-1] }
+
+// rotateLocked seals the active segment and starts the next one. The sealed
+// file stays open until an fsync has covered it.
+func (w *WAL) rotateLocked() error {
+	if err := w.w.Flush(); err != nil {
+		return err
+	}
+	w.writeSeq++
+	w.dirty = false
+	old := w.active()
+	w.unsynced = append(w.unsynced, old.f)
+	return w.startSegmentLocked(old.seq + 1)
 }
 
 func encodeRecord(typ byte, payload []byte) []byte {
@@ -220,11 +343,20 @@ func encodeRecord(typ byte, payload []byte) []byte {
 	return buf
 }
 
-func (w *WAL) writeRecord(typ byte, payload []byte) error {
-	if _, err := w.w.Write(encodeRecord(typ, payload)); err != nil {
+func (w *WAL) writeRecordLocked(typ byte, payload []byte) error {
+	rec := encodeRecord(typ, payload)
+	if _, err := w.w.Write(rec); err != nil {
 		return err
 	}
+	w.activeSize += int64(len(rec))
 	w.dirty = true
+	return nil
+}
+
+func (w *WAL) maybeRotateLocked() error {
+	if w.activeSize >= w.SegmentSize {
+		return w.rotateLocked()
+	}
 	return nil
 }
 
@@ -257,14 +389,24 @@ func (w *WAL) Load() (raft.State, error) {
 func (w *WAL) SaveHardState(hs raft.HardState) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.writeRecord(recHardState, hardStatePayload(hs))
+	w.hs = hs
+	if err := w.writeRecordLocked(recHardState, hardStatePayload(hs)); err != nil {
+		return err
+	}
+	return w.maybeRotateLocked()
 }
 
 func (w *WAL) Append(entries []raft.Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, e := range entries {
-		if err := w.writeRecord(recEntry, entryPayload(e)); err != nil {
+		if err := w.writeRecordLocked(recEntry, entryPayload(e)); err != nil {
+			return err
+		}
+		if a := w.active(); e.Index > a.lastIndex {
+			a.lastIndex = e.Index
+		}
+		if err := w.maybeRotateLocked(); err != nil {
 			return err
 		}
 	}
@@ -276,7 +418,17 @@ func (w *WAL) TruncateFrom(index uint64) error {
 	defer w.mu.Unlock()
 	var p [8]byte
 	binary.LittleEndian.PutUint64(p[:], index)
-	return w.writeRecord(recTruncate, p[:])
+	if err := w.writeRecordLocked(recTruncate, p[:]); err != nil {
+		return err
+	}
+	return w.maybeRotateLocked()
+}
+
+func (w *WAL) barrier(f *os.File) error {
+	if w.Barrier == SyncFsync {
+		return syscall.Fsync(int(f.Fd()))
+	}
+	return f.Sync()
 }
 
 // Sync makes every record written so far durable. Concurrent callers share
@@ -315,13 +467,17 @@ func (w *WAL) Sync() error {
 		w.dirty = false
 		w.writeSeq++
 	}
-	cover, f := w.writeSeq, w.f
+	cover := w.writeSeq
+	files := append(w.unsynced, w.active().f)
+	w.unsynced = nil
 	w.mu.Unlock()
 
 	if !w.NoSync {
 		start := time.Now()
-		if err := w.barrier(f); err != nil {
-			return err
+		for _, f := range files {
+			if err := w.barrier(f); err != nil {
+				return err
+			}
 		}
 		if w.SyncObserver != nil {
 			w.SyncObserver(time.Since(start))
@@ -335,96 +491,85 @@ func (w *WAL) Sync() error {
 	return nil
 }
 
-// SaveSnapshot stores snap, then rewrites the log file without the entries it
-// covers. If we crash in between, OpenWAL discards the covered entries.
+// SaveSnapshot stores snap atomically and deletes the oldest segments whose
+// entries it fully covers. Older snapshots than the stored one are ignored.
 func (w *WAL) SaveSnapshot(snap raft.Snapshot) error {
-	w.syncMu.Lock() // no fsync may run on the file we are about to replace
-	defer w.syncMu.Unlock()
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := w.w.Flush(); err != nil {
-		return err
+	stale := snap.Index <= w.snapIndex
+	w.mu.Unlock()
+	if stale {
+		return nil
 	}
-	w.dirty = false
-	w.writeSeq++
 	if err := writeSnapshotFile(w.dir, snap, !w.NoSync); err != nil {
 		return err
 	}
 
-	// Rebuild the live log from disk and write the trimmed version.
-	rf, err := os.Open(filepath.Join(w.dir, walFileName))
-	if err != nil {
+	w.syncMu.Lock() // no fsync may be running on a file we close
+	defer w.syncMu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if snap.Index > w.snapIndex {
+		w.snapIndex = snap.Index
+	}
+	var p [8]byte
+	binary.LittleEndian.PutUint64(p[:], w.snapIndex)
+	if err := w.writeRecordLocked(recSnapMark, p[:]); err != nil {
 		return err
 	}
-	st, _, err := replayFile(rf)
-	rf.Close()
-	if err != nil {
-		return err
-	}
-	entries := st.entries
-	for len(entries) > 0 && entries[0].Index <= snap.Index {
-		entries = entries[1:]
-	}
-
-	tmpPath := filepath.Join(w.dir, walFileName+".tmp")
-	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	bw := bufio.NewWriterSize(tmp, 1<<20)
-	bw.Write(encodeRecord(recHardState, hardStatePayload(st.hs)))
-	for _, e := range entries {
-		bw.Write(encodeRecord(recEntry, entryPayload(e)))
-	}
-	if err := bw.Flush(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if !w.NoSync {
-		if err := tmp.Sync(); err != nil {
-			tmp.Close()
+	for len(w.segs) > 1 && w.segs[0].lastIndex <= w.snapIndex {
+		sg := w.segs[0]
+		if sg.f != nil {
+			// Its data may sit in the page cache unsynced, but the snapshot
+			// now covers it, so it no longer matters.
+			for i, f := range w.unsynced {
+				if f == sg.f {
+					w.unsynced = append(w.unsynced[:i], w.unsynced[i+1:]...)
+					break
+				}
+			}
+			sg.f.Close()
+		}
+		if err := os.Remove(sg.path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		w.segs = w.segs[1:]
 	}
-	if err := os.Rename(tmpPath, filepath.Join(w.dir, walFileName)); err != nil {
-		tmp.Close()
-		return err
-	}
-	if !w.NoSync {
-		syncDir(w.dir)
-	}
-	w.f.Close()
-	if _, err := tmp.Seek(0, io.SeekEnd); err != nil {
-		tmp.Close()
-		return err
-	}
-	w.f = tmp
-	w.w = bufio.NewWriterSize(tmp, 1<<20)
-	w.syncedSeq = w.writeSeq // the rewritten file was fsynced with everything
 	return nil
 }
 
-// Close flushes and closes the file.
+// Close flushes and closes all files.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.w.Flush(); err != nil {
-		w.f.Close()
-		return err
+	err := w.w.Flush()
+	for _, sg := range w.segs {
+		if sg.f != nil {
+			sg.f.Close()
+			sg.f = nil
+		}
 	}
-	return w.f.Close()
+	return err
 }
 
-// Size returns the current size of the log file in bytes.
+// Size returns the total bytes held in segment files.
 func (w *WAL) Size() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.w.Flush()
-	fi, err := w.f.Stat()
-	if err != nil {
-		return 0
+	var total int64
+	for _, sg := range w.segs {
+		if fi, err := os.Stat(sg.path); err == nil {
+			total += fi.Size()
+		}
 	}
-	return fi.Size()
+	return total
+}
+
+// Segments reports how many segment files exist (for tests).
+func (w *WAL) Segments() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.segs)
 }
 
 // ---- snapshot file: crc32 | index | term | data ----
