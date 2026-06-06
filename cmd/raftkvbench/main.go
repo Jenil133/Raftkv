@@ -50,6 +50,7 @@ type result struct {
 	GOARCH     string  `json:"goarch"`
 	CPUs       int     `json:"cpus"`
 	GoVersion  string  `json:"go_version"`
+	TargetRate float64 `json:"target_rate,omitempty"`
 	InProcess  bool    `json:"in_process_cluster"`
 	Conns      int     `json:"conns_per_node"`
 	WarmupSecs float64 `json:"warmup_seconds"`
@@ -70,13 +71,15 @@ func main() {
 		jsonOut   = flag.String("json", "", "also write the result as JSON to this file")
 		snapEvery = flag.Uint64("snapshot-every", 50000, "snapshot each shard after this many entries (in-process mode; 0 disables)")
 		cpuProf   = flag.String("cpuprofile", "", "write a CPU profile of the run to this file")
+		slowLog   = flag.Duration("slowlog", 0, "print a per-100ms timeline of writes slower than this (diagnostics)")
+		rate      = flag.Float64("rate", 0, "open-loop mode: target total writes/s, spread over the clients; latency is measured from each write's scheduled start (0 = closed loop, as fast as possible)")
 	)
 	flag.Parse()
 
 	res := result{
 		Nodes: *nodes, Shards: *shards, Clients: *clients, ValueSize: *valueSize, SyncMode: *syncMode,
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, CPUs: runtime.NumCPU(), GoVersion: runtime.Version(),
-		Conns: *conns, WarmupSecs: warmup.Seconds(),
+		Conns: *conns, WarmupSecs: warmup.Seconds(), TargetRate: *rate,
 	}
 
 	var addrs map[raft.NodeID]string
@@ -115,6 +118,9 @@ func main() {
 		ops, errs atomic.Int64
 		wg        sync.WaitGroup
 		lats      = make([][]time.Duration, *clients)
+		slowMu    sync.Mutex
+		slowAt    = map[int64]int{}
+		benchT0   = time.Now()
 	)
 	value := make([]byte, *valueSize)
 	rand.New(rand.NewSource(1)).Read(value)
@@ -126,10 +132,26 @@ func main() {
 			cl := shard.NewClient(pool[c%len(pool)], *shards)
 			rng := rand.New(rand.NewSource(int64(c)))
 			local := make([]time.Duration, 0, 1<<16)
+			// In open-loop mode each client issues writes on a fixed schedule;
+			// a write that starts late is charged for the wait (no coordinated
+			// omission).
+			var interval time.Duration
+			next := time.Now()
+			if *rate > 0 {
+				interval = time.Duration(float64(time.Second) * float64(*clients) / *rate)
+				next = next.Add(time.Duration(rng.Int63n(int64(interval))))
+			}
 			for !stopFlag.Load() {
 				key := fmt.Sprintf("bench-%d", rng.Intn(*keys))
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				t := time.Now()
+				if interval > 0 {
+					if wait := time.Until(next); wait > 0 {
+						time.Sleep(wait)
+					}
+					t = next
+					next = next.Add(interval)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				err := cl.Put(ctx, key, value)
 				d := time.Since(t)
 				cancel()
@@ -142,6 +164,11 @@ func main() {
 				}
 				ops.Add(1)
 				local = append(local, d)
+				if *slowLog > 0 && d > *slowLog {
+					slowMu.Lock()
+					slowAt[int64(t.Sub(benchT0)/(100*time.Millisecond))]++
+					slowMu.Unlock()
+				}
 			}
 			lats[c] = local
 		}(c)
@@ -187,11 +214,26 @@ func main() {
 		res.MaxMs = float64(all[len(all)-1].Microseconds()) / 1000
 	}
 
-	fmt.Printf("raftkvbench: %d nodes, %d shard(s), %d clients, %dB values, sync=%s, %s/%s %d CPUs, %s\n",
-		res.Nodes, res.Shards, res.Clients, res.ValueSize, res.SyncMode, res.GOOS, res.GOARCH, res.CPUs, res.GoVersion)
+	mode := "closed loop"
+	if *rate > 0 {
+		mode = fmt.Sprintf("open loop at %.0f writes/s", *rate)
+	}
+	fmt.Printf("raftkvbench: %d nodes, %d shard(s), %d clients, %dB values, sync=%s, %s, %s/%s %d CPUs, %s\n",
+		res.Nodes, res.Shards, res.Clients, res.ValueSize, res.SyncMode, mode, res.GOOS, res.GOARCH, res.CPUs, res.GoVersion)
 	fmt.Printf("  writes: %d in %.1fs = %.0f ops/s (%d errors)\n", res.Ops, res.Seconds, res.OpsPerSec, res.Errors)
 	fmt.Printf("  latency: p50 %.2fms  p90 %.2fms  p99 %.2fms  p99.9 %.2fms  max %.2fms\n",
 		res.P50Ms, res.P90Ms, res.P99Ms, res.P999Ms, res.MaxMs)
+	if *slowLog > 0 {
+		var ks []int64
+		for k := range slowAt {
+			ks = append(ks, k)
+		}
+		sort.Slice(ks, func(i, j int) bool { return ks[i] < ks[j] })
+		fmt.Printf("  writes slower than %v, by 100ms window since start:\n", *slowLog)
+		for _, k := range ks {
+			fmt.Printf("    t=%5.1fs  %d\n", float64(k)/10, slowAt[k])
+		}
+	}
 	if *jsonOut != "" {
 		b, _ := json.MarshalIndent(res, "", "  ")
 		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
