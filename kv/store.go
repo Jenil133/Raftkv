@@ -3,6 +3,7 @@ package kv
 
 import (
 	"bytes"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -113,25 +114,36 @@ func (s *Store) Dump() map[string]string {
 	return out
 }
 
-// Snapshot serialises the whole state machine, including the client session
-// table so exactly-once guarantees survive compaction.
-func (s *Store) Snapshot() ([]byte, error) {
+// image is a point-in-time copy of the store. Values are never mutated in
+// place (writes install fresh slices), so a shallow copy of the maps is a
+// consistent snapshot that can be encoded off the apply path.
+type image struct {
+	data     map[string][]byte
+	sessions map[uint64]session
+}
+
+func (s *Store) image() image {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return image{data: maps.Clone(s.data), sessions: maps.Clone(s.sessions)}
+}
+
+func (im image) encode() ([]byte, error) {
 	snap := &kvpb.StoreSnapshot{
-		Data:     make(map[string][]byte, len(s.data)),
-		Sessions: make(map[uint64]*kvpb.SessionState, len(s.sessions)),
+		Data:     im.data,
+		Sessions: make(map[uint64]*kvpb.SessionState, len(im.sessions)),
 	}
-	for k, v := range s.data {
-		snap.Data[k] = v
-	}
-	for id, sess := range s.sessions {
+	for id, sess := range im.sessions {
 		snap.Sessions[id] = &kvpb.SessionState{
 			Seq: sess.seq, Found: sess.result.Found, Value: sess.result.Value, Swapped: sess.result.Swapped,
 		}
 	}
 	return proto.Marshal(snap)
 }
+
+// Snapshot serialises the whole state machine, including the client session
+// table so exactly-once guarantees survive compaction.
+func (s *Store) Snapshot() ([]byte, error) { return s.image().encode() }
 
 // Restore replaces the state machine with the contents of a snapshot.
 func (s *Store) Restore(data []byte) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -50,6 +51,7 @@ type Server struct {
 	observe       Observer
 	snapshotEvery uint64 // take a snapshot after this many applied entries; 0 = never
 	lastSnapshot  uint64 // index of the newest snapshot (apply loop only)
+	snapshotting  atomic.Bool
 
 	mu        sync.Mutex
 	waiters   map[uint64]*waiter
@@ -124,8 +126,8 @@ func (s *Server) applyLoop() {
 		s.advanceApplied(e.Index)
 		s.mu.Unlock()
 
-		if s.snapshotEvery > 0 && e.Index-s.lastSnapshot >= s.snapshotEvery {
-			s.takeSnapshot(e.Index)
+		if s.snapshotEvery > 0 && e.Index-s.lastSnapshot >= s.snapshotEvery && !s.snapshotting.Load() {
+			s.startSnapshot(e.Index)
 		}
 	}
 	// Node stopped: unblock anyone still waiting.
@@ -144,18 +146,23 @@ func (s *Server) advanceApplied(idx uint64) {
 	s.appliedCh = make(chan struct{})
 }
 
-func (s *Server) takeSnapshot(index uint64) {
-	data, err := s.store.Snapshot()
-	if err != nil {
-		panic(fmt.Sprintf("kv: snapshot failed: %v", err))
-	}
-	if err := s.node.Snapshot(index, data); err != nil {
-		if !errors.Is(err, raft.ErrStopped) {
+// startSnapshot copies the state machine as of index (cheap: values are
+// immutable) and encodes and persists it in the background, so applying new
+// entries never waits on serialisation or disk.
+func (s *Server) startSnapshot(index uint64) {
+	img := s.store.image()
+	s.lastSnapshot = index
+	s.snapshotting.Store(true)
+	go func() {
+		defer s.snapshotting.Store(false)
+		data, err := img.encode()
+		if err != nil {
+			panic(fmt.Sprintf("kv: snapshot failed: %v", err))
+		}
+		if err := s.node.Snapshot(index, data); err != nil && !errors.Is(err, raft.ErrStopped) {
 			panic(fmt.Sprintf("kv: raft snapshot at %d failed: %v", index, err))
 		}
-		return
-	}
-	s.lastSnapshot = index
+	}()
 }
 
 // applySnapshot replaces the state machine with a snapshot delivered by Raft,

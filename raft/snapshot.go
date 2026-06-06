@@ -22,6 +22,9 @@ func (n *Node) Snapshot(index uint64, data []byte) error {
 		n.mu.Unlock()
 		return ErrStopped
 	}
+	// Stop waits for us, so storage is never closed under our feet.
+	n.wg.Add(1)
+	defer n.wg.Done()
 	if index <= n.log.offset {
 		n.mu.Unlock()
 		return nil // already covered by an equal or newer snapshot
