@@ -67,7 +67,7 @@ func (n *Node) replicateOnce(peer NodeID, term uint64) (stillLeader, more bool) 
 		LeaderID:     n.id,
 		PrevLogIndex: prev,
 		PrevLogTerm:  prevTerm,
-		Entries:      n.log.slice(next, n.cfg.MaxEntriesPerMsg),
+		Entries:      n.log.slice(next, n.cfg.MaxEntriesPerMsg, n.cfg.MaxBytesPerMsg),
 		LeaderCommit: n.commitIndex,
 	}
 	seq := n.hbSeq

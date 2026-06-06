@@ -19,8 +19,10 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
-	// MaxEntriesPerMsg bounds the batch size of a single AppendEntries.
+	// MaxEntriesPerMsg and MaxBytesPerMsg bound the batch carried by a single
+	// AppendEntries; bigger batches mean fewer fsync rounds per entry.
 	MaxEntriesPerMsg int
+	MaxBytesPerMsg   int
 	// SnapshotChunkSize bounds the bytes sent per InstallSnapshot RPC.
 	SnapshotChunkSize int
 	// ApplyBuffer is the capacity of the channel returned by Applied.
@@ -40,7 +42,10 @@ func (c *Config) setDefaults() {
 		c.HeartbeatInterval = 40 * time.Millisecond
 	}
 	if c.MaxEntriesPerMsg == 0 {
-		c.MaxEntriesPerMsg = 256
+		c.MaxEntriesPerMsg = 4096
+	}
+	if c.MaxBytesPerMsg == 0 {
+		c.MaxBytesPerMsg = 2 << 20 // well under gRPC's 4 MiB default message limit
 	}
 	if c.SnapshotChunkSize == 0 {
 		c.SnapshotChunkSize = 256 << 10

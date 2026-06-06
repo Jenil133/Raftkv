@@ -48,14 +48,23 @@ func (l *raftLog) term(i uint64) (uint64, bool) {
 
 func (l *raftLog) entry(i uint64) Entry { return l.entries[i-l.offset] }
 
-// slice returns a copy of up to max entries starting at lo.
-func (l *raftLog) slice(lo uint64, max int) []Entry {
+// slice returns a copy of up to max entries starting at lo, stopping early
+// once their payloads exceed maxBytes (always at least one entry).
+func (l *raftLog) slice(lo uint64, max, maxBytes int) []Entry {
 	if lo > l.lastIndex() || lo < l.firstIndex() {
 		return nil
 	}
 	hi := l.lastIndex()
 	if n := hi - lo + 1; n > uint64(max) {
 		hi = lo + uint64(max) - 1
+	}
+	size := 0
+	for i := lo; i <= hi; i++ {
+		size += len(l.entries[i-l.offset].Data) + 32
+		if size > maxBytes && i > lo {
+			hi = i - 1
+			break
+		}
 	}
 	out := make([]Entry, hi-lo+1)
 	copy(out, l.entries[lo-l.offset:hi-l.offset+1])

@@ -21,14 +21,29 @@ func TestLogBasics(t *testing.T) {
 	if _, ok := l.term(7); ok {
 		t.Fatal("term(7) should be out of range")
 	}
-	if got := l.slice(2, 3); len(got) != 3 || got[0].Index != 2 || got[2].Index != 4 {
+	if got := l.slice(2, 3, 1<<20); len(got) != 3 || got[0].Index != 2 || got[2].Index != 4 {
 		t.Fatalf("slice = %+v", got)
 	}
-	if got := l.slice(5, 100); len(got) != 2 {
+	if got := l.slice(5, 100, 1<<20); len(got) != 2 {
 		t.Fatalf("slice tail len = %d", len(got))
 	}
-	if got := l.slice(7, 1); got != nil {
+	if got := l.slice(7, 1, 1<<20); got != nil {
 		t.Fatalf("slice past end = %+v", got)
+	}
+}
+
+func TestLogSliceByteLimit(t *testing.T) {
+	l := newRaftLog()
+	for i := 1; i <= 10; i++ {
+		l.append(Entry{Term: 1, Index: uint64(i), Data: make([]byte, 100)})
+	}
+	// Each entry counts as ~132 bytes, so 300 bytes fits two.
+	if got := l.slice(1, 100, 300); len(got) != 2 {
+		t.Fatalf("byte-limited slice len = %d, want 2", len(got))
+	}
+	// A single oversized entry is still sent alone.
+	if got := l.slice(1, 100, 10); len(got) != 1 {
+		t.Fatalf("oversized entry slice len = %d, want 1", len(got))
 	}
 }
 
