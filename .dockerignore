@@ -1,0 +1,6 @@
+.git
+bin
+data
+chaos-results
+phases
+*.log

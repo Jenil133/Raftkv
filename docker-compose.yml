@@ -1,0 +1,65 @@
+# Five-node RaftKv cluster plus Prometheus.
+#
+#   docker compose up -d --build
+#   go run ./cmd/raftkvctl -endpoints 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003,4=127.0.0.1:7004,5=127.0.0.1:7005 put hello world
+#   open http://localhost:9090   (Prometheus; try raftkv_raft_is_leader or raftkv_request_duration_seconds)
+#
+# Kill a node to watch failover: docker compose kill node1
+
+name: raftkv
+
+x-node: &node
+  build: .
+  image: raftkv:latest
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/healthz"]
+    interval: 5s
+    timeout: 2s
+    retries: 5
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command: ["-id=1", "-listen=0.0.0.0:7000", "-peers=1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000", "-data=/data", "-shards=4", "-metrics=0.0.0.0:9100"]
+    volumes: ["node1-data:/data"]
+    ports: ["7001:7000", "9101:9100"]
+  node2:
+    <<: *node
+    hostname: node2
+    command: ["-id=2", "-listen=0.0.0.0:7000", "-peers=1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000", "-data=/data", "-shards=4", "-metrics=0.0.0.0:9100"]
+    volumes: ["node2-data:/data"]
+    ports: ["7002:7000", "9102:9100"]
+  node3:
+    <<: *node
+    hostname: node3
+    command: ["-id=3", "-listen=0.0.0.0:7000", "-peers=1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000", "-data=/data", "-shards=4", "-metrics=0.0.0.0:9100"]
+    volumes: ["node3-data:/data"]
+    ports: ["7003:7000", "9103:9100"]
+  node4:
+    <<: *node
+    hostname: node4
+    command: ["-id=4", "-listen=0.0.0.0:7000", "-peers=1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000", "-data=/data", "-shards=4", "-metrics=0.0.0.0:9100"]
+    volumes: ["node4-data:/data"]
+    ports: ["7004:7000", "9104:9100"]
+  node5:
+    <<: *node
+    hostname: node5
+    command: ["-id=5", "-listen=0.0.0.0:7000", "-peers=1=node1:7000,2=node2:7000,3=node3:7000,4=node4:7000,5=node5:7000", "-data=/data", "-shards=4", "-metrics=0.0.0.0:9100"]
+    volumes: ["node5-data:/data"]
+    ports: ["7005:7000", "9105:9100"]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [node1, node2, node3, node4, node5]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
