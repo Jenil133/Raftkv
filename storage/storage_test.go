@@ -259,7 +259,7 @@ func TestWALCrashBetweenSnapshotAndRewrite(t *testing.T) {
 	w.Close()
 	// Simulate dying right after the snapshot file landed but before the log
 	// was rewritten: the old log still holds entries the snapshot covers.
-	if err := writeSnapshotFile(dir, raft.Snapshot{Index: 6, Term: 1, Data: []byte("s")}, false); err != nil {
+	if err := writeSnapshotFile(dir, raft.Snapshot{Index: 6, Term: 1, Data: []byte("s")}, nil); err != nil {
 		t.Fatal(err)
 	}
 	w2, err := OpenWAL(dir)

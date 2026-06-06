@@ -87,6 +87,7 @@ type WAL struct {
 	hs         raft.HardState
 	snapIndex  uint64
 	unsynced   []*os.File // sealed files with data not yet fsynced
+	dirDirty   bool       // a segment was created since the last directory fsync
 
 	// Group commit: every flush bumps writeSeq; an fsync started after a
 	// flush makes it durable and advances syncedSeq. syncMu serialises
@@ -313,9 +314,9 @@ func (w *WAL) startSegmentLocked(seq uint64) error {
 	w.segs = append(w.segs, &segment{seq: seq, path: path, f: f})
 	w.w = bufio.NewWriterSize(f, 1<<20)
 	w.activeSize = 0
-	if !w.NoSync {
-		syncDir(w.dir)
-	}
+	// The new directory entry is made durable by the next Sync, outside the
+	// lock, so rotating never stalls appends on a directory fsync.
+	w.dirDirty = true
 	return w.writeRecordLocked(recHardState, hardStatePayload(w.hs))
 }
 
@@ -470,12 +471,25 @@ func (w *WAL) Sync() error {
 	cover := w.writeSeq
 	files := append(w.unsynced, w.active().f)
 	w.unsynced = nil
+	dirDirty := w.dirDirty
+	w.dirDirty = false
 	w.mu.Unlock()
 
 	if !w.NoSync {
 		start := time.Now()
 		for _, f := range files {
 			if err := w.barrier(f); err != nil {
+				return err
+			}
+		}
+		if dirDirty {
+			d, err := os.Open(w.dir)
+			if err != nil {
+				return err
+			}
+			err = w.barrier(d)
+			d.Close()
+			if err != nil {
 				return err
 			}
 		}
@@ -500,7 +514,11 @@ func (w *WAL) SaveSnapshot(snap raft.Snapshot) error {
 	if stale {
 		return nil
 	}
-	if err := writeSnapshotFile(w.dir, snap, !w.NoSync); err != nil {
+	var barrier func(*os.File) error
+	if !w.NoSync {
+		barrier = w.barrier
+	}
+	if err := writeSnapshotFile(w.dir, snap, barrier); err != nil {
 		return err
 	}
 
@@ -574,7 +592,9 @@ func (w *WAL) Segments() int {
 
 // ---- snapshot file: crc32 | index | term | data ----
 
-func writeSnapshotFile(dir string, snap raft.Snapshot, sync bool) error {
+// writeSnapshotFile replaces the snapshot atomically. barrier makes data and
+// directory durable; nil skips syncing.
+func writeSnapshotFile(dir string, snap raft.Snapshot, barrier func(*os.File) error) error {
 	buf := make([]byte, 20+len(snap.Data))
 	binary.LittleEndian.PutUint64(buf[4:12], snap.Index)
 	binary.LittleEndian.PutUint64(buf[12:20], snap.Term)
@@ -590,8 +610,8 @@ func writeSnapshotFile(dir string, snap raft.Snapshot, sync bool) error {
 		f.Close()
 		return err
 	}
-	if sync {
-		if err := f.Sync(); err != nil {
+	if barrier != nil {
+		if err := barrier(f); err != nil {
 			f.Close()
 			return err
 		}
@@ -602,8 +622,13 @@ func writeSnapshotFile(dir string, snap raft.Snapshot, sync bool) error {
 	if err := os.Rename(tmpPath, filepath.Join(dir, snapFileName)); err != nil {
 		return err
 	}
-	if sync {
-		syncDir(dir)
+	if barrier != nil {
+		d, err := os.Open(dir)
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		return barrier(d)
 	}
 	return nil
 }
@@ -624,11 +649,4 @@ func readSnapshotFile(dir string) (raft.Snapshot, error) {
 		Term:  binary.LittleEndian.Uint64(buf[12:20]),
 		Data:  buf[20:],
 	}, nil
-}
-
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
-	}
 }
