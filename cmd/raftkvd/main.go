@@ -23,7 +23,7 @@ func main() {
 		listen    = flag.String("listen", "", "address to listen on (default: this node's address from -peers)")
 		dataDir   = flag.String("data", "", "directory for the write-ahead log (default: ./data/node<id>)")
 		shards    = flag.Int("shards", 4, "number of Raft groups (must match on every node)")
-		snapEvery = flag.Uint64("snapshot-every", 10000, "snapshot each shard after this many applied entries (0 disables)")
+		snapEvery = flag.Uint64("snapshot-every", 50000, "snapshot each shard after this many applied entries (0 disables)")
 		metricsAt = flag.String("metrics", "", "address for the HTTP /metrics, /healthz and /readyz endpoints (e.g. :9100)")
 		syncMode  = flag.String("sync", "full", "WAL durability: full (power-loss safe; F_FULLFSYNC on macOS), fsync (plain fsync), none (unsafe)")
 		election  = flag.Duration("election-timeout", 300*time.Millisecond, "minimum election timeout")
