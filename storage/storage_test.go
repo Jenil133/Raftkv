@@ -385,3 +385,42 @@ func TestWALIgnoresStaleSnapshot(t *testing.T) {
 		t.Fatalf("stale snapshot overwrote newer: %+v", st.Snapshot)
 	}
 }
+
+func TestWALConcurrentSaveSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := OpenWAL(dir)
+	w.NoSync = true
+	w.Append(entries(1, 1, 50))
+	w.Sync()
+	done := make(chan struct{})
+	for i := 1; i <= 8; i++ {
+		go func(i int) {
+			defer func() { done <- struct{}{} }()
+			data := make([]byte, 64<<10)
+			for j := range data {
+				data[j] = byte(i)
+			}
+			if err := w.SaveSnapshot(raft.Snapshot{Index: uint64(i * 5), Term: 1, Data: data}); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		<-done
+	}
+	w.Close()
+	w2, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	st := mustLoad(t, w2)
+	if st.Snapshot.Index != 40 {
+		t.Fatalf("newest snapshot lost: index %d", st.Snapshot.Index)
+	}
+	for _, b := range st.Snapshot.Data {
+		if b != 8 {
+			t.Fatal("snapshot data interleaved from concurrent writers")
+		}
+	}
+}

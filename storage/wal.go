@@ -95,6 +95,9 @@ type WAL struct {
 	syncMu    sync.Mutex
 	writeSeq  uint64
 	syncedSeq uint64
+	// snapMu serialises SaveSnapshot calls (they share a temp file). It is
+	// separate from syncMu so writing a large snapshot never blocks fsyncs.
+	snapMu sync.Mutex
 
 	loaded raft.State // replayed at open, handed out once by Load
 
@@ -508,6 +511,8 @@ func (w *WAL) Sync() error {
 // SaveSnapshot stores snap atomically and deletes the oldest segments whose
 // entries it fully covers. Older snapshots than the stored one are ignored.
 func (w *WAL) SaveSnapshot(snap raft.Snapshot) error {
+	w.snapMu.Lock()
+	defer w.snapMu.Unlock()
 	w.mu.Lock()
 	stale := snap.Index <= w.snapIndex
 	w.mu.Unlock()
