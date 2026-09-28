@@ -6,3 +6,4 @@ chaos-results/
 /raftkvctl
 /raftkvbench
 /raftkvchaos
+.DS_Store
